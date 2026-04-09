@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "rtp_llm/cpp/cache/connector/p2p/transfer/mooncake/MooncakeKVCacheReceiver.h"
+#include "rtp_llm/cpp/cache/connector/p2p/transfer/mooncake/MooncakeKVCacheSender.h"
 #include "rtp_llm/cpp/cache/connector/p2p/transfer/tcp/TcpKVCacheSender.h"
 #include "rtp_llm/cpp/cache/connector/p2p/transfer/tcp/TcpKVCacheReceiver.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -39,6 +41,31 @@ TransferBackendPair createTcpBackend(const TransferBackendConfig&        config,
     return {sender, receiver};
 }
 
+TransferBackendPair createMooncakeBackend(const TransferBackendConfig&        config,
+                                          const kmonitor::MetricsReporterPtr& metrics_reporter) {
+    auto sender = std::make_shared<mooncake::MooncakeKVCacheSender>(config, metrics_reporter);
+    const auto idle_ms = config.tcp_channel_idle_ttl_ms > 0 ? config.tcp_channel_idle_ttl_ms : int64_t{0};
+    const auto sweep_n = config.tcp_channel_sweep_interval_calls > 0 ?
+                             static_cast<std::uint64_t>(config.tcp_channel_sweep_interval_calls) :
+                             std::uint64_t{0};
+    if (!sender->init(config.messager_io_thread_count, std::chrono::milliseconds(idle_ms), sweep_n)) {
+        RTP_LLM_LOG_ERROR("createMooncakeBackend: MooncakeKVCacheSender init failed");
+        return {};
+    }
+
+    auto receiver = std::make_shared<mooncake::MooncakeKVCacheReceiver>(config, metrics_reporter);
+    if (!receiver->init(config.cache_store_listen_port,
+                        config.messager_io_thread_count,
+                        config.messager_worker_thread_count,
+                        static_cast<uint32_t>(config.cache_store_tcp_anet_rpc_thread_num),
+                        static_cast<uint32_t>(config.cache_store_tcp_anet_rpc_queue_num))) {
+        RTP_LLM_LOG_ERROR("createMooncakeBackend: MooncakeKVCacheReceiver init failed");
+        return {};
+    }
+
+    return {sender, receiver};
+}
+
 }  // anonymous namespace
 
 TransferBackendPair createTransferBackend(TransferBackend                     backend,
@@ -49,6 +76,8 @@ TransferBackendPair createTransferBackend(TransferBackend                     ba
             return createTcpBackend(config, metrics_reporter);
         case TransferBackend::kBarexRdma:
             throw std::runtime_error("BarexRdma backend not supported in this build");
+        case TransferBackend::kMooncakeClassic:
+            return createMooncakeBackend(config, metrics_reporter);
         default:
             RTP_LLM_LOG_ERROR("createTransferBackend: unknown backend");
             return {};

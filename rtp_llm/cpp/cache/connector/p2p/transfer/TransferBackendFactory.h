@@ -12,6 +12,7 @@ namespace transfer {
 enum class TransferBackend {
     kTcp,
     kBarexRdma,
+    kMooncakeClassic,
 };
 
 struct TransferBackendPair {

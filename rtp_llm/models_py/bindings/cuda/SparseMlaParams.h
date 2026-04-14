@@ -40,6 +40,8 @@ private:
     void refreshBuffer(int batch_size, int token_num, bool is_prefill);
 
 public:
+    using FlashInferMlaAttnParams::fillParams;
+
     void fillParams(torch_ext::PyAttentionInputs attn_inputs, int seq_size_per_block, bool forbid_realloc = false);
 
     // SparseMlaParams-specific outputs (5 parameters)

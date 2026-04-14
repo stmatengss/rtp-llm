@@ -61,6 +61,8 @@ protected:
         const std::vector<std::vector<int64_t>>& shapes, bool is_device, torch::ScalarType dtype = torch::kInt32);
 
 public:
+    using ParamsBase::fillParams;
+
     void fillParams(torch::Tensor t_prefix_lengths,
                     torch::Tensor t_sequence_lengths,
                     torch::Tensor t_input_lengths,

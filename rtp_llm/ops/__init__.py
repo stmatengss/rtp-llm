@@ -1,6 +1,7 @@
 import logging
 import os
 import pathlib
+import site
 import sys
 import traceback
 from typing import List
@@ -56,17 +57,31 @@ def find_th_transformer(current_dir: str):
     return None
 
 
+def find_site_packages_so() -> str | None:
+    for site_dir in site.getsitepackages() + [site.getusersitepackages()]:
+        candidate = os.path.join(site_dir, "rtp_llm", "libs")
+        if os.path.exists(os.path.join(candidate, SO_NAME)):
+            logging.info(f"found {SO_NAME} in site-packages: {candidate}")
+            return candidate
+    return None
+
+
 so_path = os.path.join(libs_path)
 if not os.path.exists(os.path.join(so_path, SO_NAME)):
     logging.info(
         f"failed to load libth_transformer_config.so from libs, try use another path"
     )
+    site_packages_so_path = find_site_packages_so()
+    if site_packages_so_path:
+        so_path = site_packages_so_path
+
     # for debug useage, read in bazel-bin and bazel-bin's subdir
-    bazel_bin_dir = os.path.join(parent_dir, "../bazel-bin")
-    so_path = find_th_transformer(bazel_bin_dir)
-    logging.info(f"failed to find {SO_NAME} in {bazel_bin_dir}")
-    if not so_path:
-        so_path = find_upper_so(current_dir)
+    if not os.path.exists(os.path.join(so_path, SO_NAME)):
+        bazel_bin_dir = os.path.join(parent_dir, "../bazel-bin")
+        so_path = find_th_transformer(bazel_bin_dir)
+        logging.info(f"failed to find {SO_NAME} in {bazel_bin_dir}")
+        if not so_path:
+            so_path = find_upper_so(current_dir)
 
 logging.info(f"so path: {so_path}")
 sys.path.append(so_path)

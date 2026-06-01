@@ -10,8 +10,16 @@ from rtp_llm.omni.config.stage_config import (
 
 class TestOmniPipelineRegistry(unittest.TestCase):
     def setUp(self):
+        self._saved_registry = dict(OmniPipelineRegistry._registry)
+        self._saved_arch_registry = dict(OmniPipelineRegistry._arch_registry)
         OmniPipelineRegistry._registry.clear()
         OmniPipelineRegistry._arch_registry.clear()
+
+    def tearDown(self):
+        OmniPipelineRegistry._registry.clear()
+        OmniPipelineRegistry._arch_registry.clear()
+        OmniPipelineRegistry._registry.update(self._saved_registry)
+        OmniPipelineRegistry._arch_registry.update(self._saved_arch_registry)
 
     def _make_pipeline(self, model_type="test_omni"):
         return OmniPipelineConfig(

@@ -12,7 +12,12 @@ class MockProcessor(StageProcessorBase):
 
 class TestStageProcessorRegistry(unittest.TestCase):
     def setUp(self):
+        self._saved_registry = dict(StageProcessorRegistry._registry)
         StageProcessorRegistry._registry.clear()
+
+    def tearDown(self):
+        StageProcessorRegistry._registry.clear()
+        StageProcessorRegistry._registry.update(self._saved_registry)
 
     def test_register_and_get(self):
         StageProcessorRegistry.register("test.mock", MockProcessor)

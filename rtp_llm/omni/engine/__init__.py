@@ -8,3 +8,4 @@ from rtp_llm.omni.engine.stage_connector import (
 )
 from rtp_llm.omni.engine.stage_pool import OmniStagePool
 from rtp_llm.omni.engine.stage_processor_base import StageProcessorBase
+from rtp_llm.omni.engine.stage_processor_registry import StageProcessorRegistry

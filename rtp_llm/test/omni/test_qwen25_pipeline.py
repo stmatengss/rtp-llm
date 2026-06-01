@@ -1,7 +1,11 @@
 import unittest
 
+import torch
+
 from rtp_llm.omni.config.pipeline_registry import OmniPipelineRegistry
 from rtp_llm.omni.config.stage_config import StageExecutionType
+from rtp_llm.omni.engine.stage_connector import StageOutput
+from rtp_llm.omni.engine.stage_processor_registry import StageProcessorRegistry
 
 
 class TestQwen25OmniPipeline(unittest.TestCase):
@@ -69,6 +73,64 @@ class TestQwen25OmniPipeline(unittest.TestCase):
         self.assertEqual(len(final_stages), 2)
         types = {s.final_output_type for s in final_stages}
         self.assertEqual(types, {"text", "audio"})
+
+
+class TestThinker2TalkerProcessor(unittest.TestCase):
+    def test_processor_registered(self):
+        from rtp_llm.omni.models.qwen2_5_omni import stage_processors  # noqa: F401
+
+        cls = StageProcessorRegistry.get("qwen2_5_omni.thinker2talker")
+        self.assertIsNotNone(cls)
+
+    def test_process_extracts_embeddings(self):
+        from rtp_llm.omni.models.qwen2_5_omni.stage_processors import (
+            Thinker2TalkerProcessor,
+        )
+
+        processor = Thinker2TalkerProcessor()
+        embeddings = torch.randn(10, 3584)
+        source = StageOutput(
+            token_ids=[1, 2, 3],
+            embeddings=embeddings,
+            metadata={"text": "Hello"},
+        )
+        result = processor.process(source)
+        self.assertIsNotNone(result.embeddings)
+        self.assertEqual(result.embeddings.shape, embeddings.shape)
+        self.assertIn("source_token_ids", result.metadata)
+
+    def test_process_without_embeddings_passes_tokens(self):
+        from rtp_llm.omni.models.qwen2_5_omni.stage_processors import (
+            Thinker2TalkerProcessor,
+        )
+
+        processor = Thinker2TalkerProcessor()
+        source = StageOutput(token_ids=[1, 2, 3], metadata={"text": "Hello"})
+        result = processor.process(source)
+        self.assertIsNone(result.embeddings)
+        self.assertEqual(result.metadata["source_token_ids"], [1, 2, 3])
+
+
+class TestTalker2Token2WavProcessor(unittest.TestCase):
+    def test_processor_registered(self):
+        from rtp_llm.omni.models.qwen2_5_omni import stage_processors  # noqa: F401
+
+        cls = StageProcessorRegistry.get("qwen2_5_omni.talker2token2wav")
+        self.assertIsNotNone(cls)
+
+    def test_process_extracts_codec_tokens(self):
+        from rtp_llm.omni.models.qwen2_5_omni.stage_processors import (
+            Talker2Token2WavProcessor,
+        )
+
+        processor = Talker2Token2WavProcessor()
+        source = StageOutput(
+            token_ids=[100, 200, 300, 8294],
+            metadata={"stage": "talker"},
+        )
+        result = processor.process(source)
+        self.assertEqual(result.token_ids, [100, 200, 300])
+        self.assertNotIn(8294, result.token_ids)
 
 
 if __name__ == "__main__":

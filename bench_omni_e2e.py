@@ -350,10 +350,10 @@ def run_hybrid_mode(args):
 
 
 def run_rtp_mode(args):
-    """Run e2e with rtp-llm thinker + engine-based talker + token2wav."""
+    """Run e2e with rtp-llm thinker + C++ engine talker + token2wav."""
     from rtp_llm.omni.models.qwen2_5_omni.talker import Qwen2_5OmniTalker
-    from rtp_llm.omni.models.qwen2_5_omni.talker_engine_wrapper import TalkerEngineWrapper
     from rtp_llm.omni.models.qwen2_5_omni.token2wav_model import Token2WavModel
+    from rtp_llm.async_decoder_engine.engine_creator import create_engine
     from rtp_llm.ops import (
         ParallelismConfig, RuntimeConfig, FMHAConfig, DeviceResourceConfig,
         MoeConfig, NcclCommConfig, PDSepConfig, ConcurrencyConfig,
@@ -369,12 +369,15 @@ def run_rtp_mode(args):
     device = args.device
     t0 = time.time()
 
-    # Create engine config
+    # Create engine config — use negative start_port so gRPC server won't bind
+    talker_server_config = ServerConfig()
+    talker_server_config.start_port = -100
+
     engine_config = EngineConfig(
         parallelism_config=ParallelismConfig(),
         runtime_config=RuntimeConfig(),
         nccl_comm_config=NcclCommConfig(),
-        server_config=ServerConfig(),
+        server_config=talker_server_config,
         pd_sep_config=PDSepConfig(),
         concurrency_config=ConcurrencyConfig(),
         fmha_config=FMHAConfig(),
@@ -392,7 +395,7 @@ def run_rtp_mode(args):
         load_config=LoadConfig(),
     )
 
-    # Load talker as rtp engine
+    # Load talker model with Python model
     logger.info("=== Loading talker engine ===")
     t_load_start = time.time()
     talker_config = Qwen2_5OmniTalker._create_config(args.ckpt)
@@ -427,13 +430,16 @@ def run_rtp_mode(args):
 
     talker_model = Qwen2_5OmniTalker.from_config(**from_config_kwargs)
 
-    class FakeEngine:
-        def __init__(self, model):
-            self.model = model
+    # Create and start the C++ engine
+    alog_conf_path = engine_config.profiling_debug_logging_config.ft_alog_conf_path
+    talker_engine = create_engine(
+        model=talker_model, engine_config=engine_config,
+        alog_conf_path=alog_conf_path, world_info=None,
+    )
+    talker_engine.start()
 
-    wrapper = TalkerEngineWrapper(FakeEngine(talker_model))
     t1 = time.time()
-    logger.info(f"Talker engine loaded in {t1 - t_load_start:.1f}s")
+    logger.info(f"Talker C++ engine loaded and started in {t1 - t_load_start:.1f}s")
 
     # Load token2wav
     token2wav = Token2WavModel.from_pretrained(args.ckpt, device=device)
@@ -459,25 +465,29 @@ def run_rtp_mode(args):
         logger.error("No hidden states from thinker!")
         return
 
-    # Convert hidden states to tensor
+    # Set thinker hidden states on the Python model
     dtype = torch.bfloat16
     thinker_hs = torch.tensor(per_token_hs, dtype=dtype, device=device)
     logger.info(f"Thinker hidden states: {thinker_hs.shape}")
 
-    # Run talker via engine wrapper
-    logger.info("=== Running talker (rtp engine) ===")
-    initial_tokens = torch.tensor([speaker_bos], dtype=torch.long, device=device)
+    py_model = talker_model.py_model
+    if py_model is not None and hasattr(py_model, 'set_thinker_hidden_states'):
+        py_model.set_thinker_hidden_states(thinker_hs)
+
+    # Run talker via C++ engine generate
+    logger.info("=== Running talker (C++ engine) ===")
+    initial_tokens = torch.tensor([speaker_bos], dtype=torch.int32)
 
     t_talker_start = time.time()
-    codec_tokens = wrapper.generate(
-        thinker_hidden_states=thinker_hs,
-        initial_token_ids=initial_tokens,
-        max_new_tokens=args.max_talker_tokens,
-        eos_token_id=8294,
+    codec_tokens = talker_engine.rtp_llm_op_.generate(
+        initial_tokens, args.max_talker_tokens, 8294
     )
     t_talker_end = time.time()
     num_codec = codec_tokens.shape[1]
     logger.info(f"Talker: {t_talker_end - t_talker_start:.2f}s, {num_codec} codec tokens")
+
+    if py_model is not None and hasattr(py_model, 'clear_thinker_hidden_states'):
+        py_model.clear_thinker_hidden_states()
 
     if num_codec == 0:
         logger.error("No codec tokens generated!")

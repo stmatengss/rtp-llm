@@ -29,6 +29,8 @@ public:
     void pause();
     void restart();
 
+    torch::Tensor generate(torch::Tensor input_ids, int64_t max_new_tokens, int64_t eos_token_id);
+
 private:
     void             _init(int64_t                                       model_rpc_port,
                            int64_t                                       http_port,

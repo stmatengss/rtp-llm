@@ -273,13 +273,12 @@ class OmniEngine:
         return True
 
     def initialize_audio_pipeline(self, ckpt_path: str, audio_device: str = "cuda:0"):
-        """Load talker wrapper, token2wav, and speaker data for audio generation.
+        """Load token2wav and speaker data for audio generation.
 
         The talker engine is already loaded via initialize_stages() as a
-        LanguageCppEngine. This method creates the TalkerEngineWrapper for
-        generation and loads the remaining audio components.
+        LanguageCppEngine with a Python model. Generation uses the C++ engine's
+        autoregressive loop via engine.generate().
         """
-        from rtp_llm.omni.models.qwen2_5_omni.talker_engine_wrapper import TalkerEngineWrapper
         from rtp_llm.omni.models.qwen2_5_omni.token2wav_model import Token2WavModel
 
         logger.info(f"Loading audio pipeline on {audio_device}...")
@@ -288,8 +287,6 @@ class OmniEngine:
             logger.warning(
                 "Talker engine not loaded — call initialize_stages() first"
             )
-        else:
-            self._talker_wrapper = TalkerEngineWrapper(self._talker_engine)
 
         self._token2wav = Token2WavModel.from_pretrained(ckpt_path, device=audio_device)
 
@@ -312,9 +309,13 @@ class OmniEngine:
     def audio_pipeline_ready(self) -> bool:
         return (
             self._talker_engine is not None
-            and hasattr(self, '_talker_wrapper')
             and self._token2wav is not None
         )
+
+    def _get_talker_py_model(self):
+        if self._talker_engine is None:
+            return None
+        return getattr(self._talker_engine.model, 'py_model', None)
 
     @torch.no_grad()
     def generate_audio(
@@ -326,10 +327,11 @@ class OmniEngine:
         speaker: str = "Chelsie",
         max_talker_tokens: int = 4096,
     ) -> Optional[torch.Tensor]:
-        """Generate audio waveform from thinker outputs via engine-based talker.
+        """Generate audio waveform from thinker outputs via the C++ engine.
 
-        Uses TalkerEngineWrapper which accesses the talker LanguageCppEngine's
-        loaded weights for the custom embedding + projection + transformer pass.
+        The talker runs as a LanguageCppEngine. Generation uses the C++ engine's
+        autoregressive loop: the Python model's forward() is called at each step,
+        combining codec embeddings with thinker hidden states.
 
         Args:
             text: generated text from thinker
@@ -357,24 +359,26 @@ class OmniEngine:
         dtype = torch.bfloat16
         spk = self._speaker_data[speaker]
 
-        # Convert thinker hidden states to tensor
         thinker_hs = torch.tensor(
             per_token_hidden_states, dtype=dtype, device=device
         )
 
-        # Initial codec token: speaker BOS token
+        py_model = self._get_talker_py_model()
+        if py_model is not None and hasattr(py_model, 'set_thinker_hidden_states'):
+            py_model.set_thinker_hidden_states(thinker_hs)
+
         initial_tokens = torch.tensor(
-            [spk["bos_token"]], dtype=torch.long, device=device
+            [spk["bos_token"]], dtype=torch.int32
+        )
+        eos_token_id = self._talker_engine.config.special_tokens.eos_token_id
+
+        codec_tokens = self._talker_engine.rtp_llm_op_.generate(
+            initial_tokens, max_talker_tokens, eos_token_id
         )
 
-        # Generate codec tokens via talker engine wrapper
-        codec_tokens = self._talker_wrapper.generate(
-            thinker_hidden_states=thinker_hs,
-            initial_token_ids=initial_tokens,
-            max_new_tokens=max_talker_tokens,
-        )
+        if py_model is not None and hasattr(py_model, 'clear_thinker_hidden_states'):
+            py_model.clear_thinker_hidden_states()
 
-        # Filter special tokens (pad=8292, start=8293, end=8294, etc.)
         mask = codec_tokens[0] < 8292
         codec_filtered = codec_tokens[0][mask].unsqueeze(0)
         if codec_filtered.shape[1] == 0:
@@ -383,7 +387,6 @@ class OmniEngine:
 
         logger.info(f"Generated {codec_filtered.shape[1]} codec tokens")
 
-        # Generate waveform via token2wav
         waveform = self._token2wav(
             codec_filtered.to(device),
             conditioning=spk["cond"],

@@ -15,6 +15,8 @@
 #include "rtp_llm/cpp/engine_base/WeightsConverter.h"
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/models/models_weight/W.h"
+#include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
+#include "rtp_llm/cpp/engine_base/stream/GenerateConfig.h"
 
 using namespace std;
 namespace th = torch;
@@ -395,6 +397,65 @@ void RtpLLMOp::restart() {
     engine->restart();
 }
 
+torch::Tensor RtpLLMOp::generate(torch::Tensor input_ids, int64_t max_new_tokens, int64_t eos_token_id) {
+    auto engine = model_rpc_service_->getEngine();
+    RTP_LLM_CHECK_WITH_INFO(engine != nullptr, "Engine not initialized");
+
+    auto generate_config = std::make_shared<GenerateConfig>();
+    generate_config->max_new_tokens = max_new_tokens;
+    generate_config->do_sample = false;
+    generate_config->top_k = 1;
+    generate_config->is_streaming = false;
+    generate_config->return_output_ids = true;
+    if (eos_token_id >= 0) {
+        generate_config->stop_words_list.push_back({static_cast<int>(eos_token_id)});
+    }
+
+    static std::atomic<int64_t> request_counter{100000};
+    auto generate_input = std::make_shared<GenerateInput>();
+    generate_input->input_ids = input_ids.to(torch::kInt32).contiguous();
+    generate_input->generate_config = generate_config;
+    generate_input->request_id = request_counter.fetch_add(1);
+
+    auto stream = engine->enqueue(generate_input);
+    RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "Failed to enqueue generate request");
+
+    std::vector<int32_t> all_output_ids;
+    {
+        pybind11::gil_scoped_release release;
+        while (true) {
+            auto output_result = stream->nextOutput();
+            if (!output_result.ok()) {
+                RTP_LLM_LOG_WARNING("Generate stream error: %s", output_result.status().error_message.c_str());
+                break;
+            }
+            auto& outputs = output_result.value();
+            for (auto& output : outputs.generate_outputs) {
+                if (output.output_ids.defined() && output.output_ids.numel() > 0) {
+                    auto ids_cpu = output.output_ids.cpu().contiguous();
+                    auto data_ptr = ids_cpu.data_ptr<int32_t>();
+                    int64_t total = ids_cpu.numel();
+                    for (int64_t i = 0; i < total; i++) {
+                        all_output_ids.push_back(data_ptr[i]);
+                    }
+                }
+                if (output.finished) {
+                    goto done;
+                }
+            }
+        }
+        done:;
+    }
+
+    if (all_output_ids.empty()) {
+        return torch::empty({1, 0}, torch::kInt32);
+    }
+    auto result = torch::from_blob(all_output_ids.data(),
+                                   {1, static_cast<int64_t>(all_output_ids.size())},
+                                   torch::kInt32).clone();
+    return result;
+}
+
 void registerRtpLLMOp(const py::module& m) {
     pybind11::class_<RtpLLMOp>(m, "RtpLLMOp")
         .def(pybind11::init<>())
@@ -412,7 +473,12 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("world_info"),
              py::arg("tokenizer"),
              py::arg("render"))
-        .def("stop", &RtpLLMOp::stop);
+        .def("stop", &RtpLLMOp::stop)
+        .def("generate",
+             &RtpLLMOp::generate,
+             py::arg("input_ids"),
+             py::arg("max_new_tokens"),
+             py::arg("eos_token_id"));
 }
 
 }  // namespace rtp_llm

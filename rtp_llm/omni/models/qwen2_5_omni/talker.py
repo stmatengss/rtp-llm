@@ -41,6 +41,22 @@ class Qwen2_5OmniTalkerWeight(QWenV2Weight):
 
 
 class Qwen2_5OmniTalker(QWenV2):
+    def _create_python_model(self):
+        from rtp_llm.models_py.model_desc.qwen2_5_omni_talker import (
+            Qwen2_5OmniTalkerModel,
+        )
+
+        self.py_model = Qwen2_5OmniTalkerModel(
+            self.model_config,
+            self.parallelism_config,
+            self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            quant_config=self.model_config.quant_config,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+            device_resource_config=self.device_resource_config,
+        )
+
     @classmethod
     def _create_config(cls, ckpt_path: str) -> ModelConfig:
         config = ModelConfig()

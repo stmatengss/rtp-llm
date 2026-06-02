@@ -54,11 +54,12 @@ class OmniEngine:
 
         self.stage_engines: Dict[int, Any] = {}
         self._primary_engine = None
+        self._thinker_engine = None
+        self._talker_engine = None
         self.started = False
 
-        self._talker = None
+        self._talker_wrapper = None
         self._token2wav = None
-        self._thinker_embed = None
         self._speaker_data: Dict[str, Any] = {}
 
         logger.info(
@@ -96,6 +97,52 @@ class OmniEngine:
                 result[stage.final_output_type] = stage.stage_id
         return result
 
+    def _create_stage_model_config(
+        self,
+        stage: OmniStageConfig,
+        main_model_config: Any,
+        engine_config: Any,
+    ) -> Any:
+        """Create a stage-specific ModelConfig for non-primary stages (e.g. talker).
+
+        Calls model_cls._create_config() for architecture-specific settings,
+        then copies shared runtime settings from the main (thinker) config.
+        """
+        from rtp_llm.model_factory import ModelFactory
+
+        model_cls = ModelFactory.get_model_cls(stage.model_type)
+        stage_config = model_cls._create_config(main_model_config.ckpt_path)
+
+        stage_config.ckpt_path = main_model_config.ckpt_path
+        stage_config.tokenizer_path = main_model_config.tokenizer_path
+        stage_config.model_type = stage.model_type
+        stage_config.max_seq_len = main_model_config.max_seq_len
+        stage_config.task_type = main_model_config.task_type
+        stage_config.use_kvcache = True
+        stage_config.phy2log_path = getattr(main_model_config, 'phy2log_path', '')
+        stage_config.attn_config.tokens_per_block = (
+            main_model_config.attn_config.tokens_per_block
+        )
+        stage_config.attn_config.kernel_tokens_per_block = (
+            main_model_config.attn_config.kernel_tokens_per_block
+        )
+
+        if engine_config is not None:
+            stage_config.init_precision_config(
+                kv_cache_config=engine_config.kv_cache_config, act_type=None
+            )
+        else:
+            stage_config.init_precision_config(kv_cache_config=None, act_type=None)
+
+        logger.info(
+            f"Created stage config for {stage.model_stage}: "
+            f"hidden_size={stage_config.hidden_size}, "
+            f"num_layers={stage_config.num_layers}, "
+            f"vocab_size={stage_config.vocab_size}, "
+            f"embedding_size={stage_config.embedding_size}"
+        )
+        return stage_config
+
     def initialize_stages(
         self,
         model_config: Any,
@@ -107,27 +154,18 @@ class OmniEngine:
         """Create per-stage sub-engines.
 
         For LLM_AR stages: creates a full LanguageCppEngine via the standard path.
-        For LLM_GENERATION stages (token2wav): creates a stub.
-
-        Currently only the first LLM_AR stage (thinker) is loaded. Other stages
-        are deferred due to GPU memory constraints (Phase 4).
+        Each stage gets its own ModelConfig with stage-specific architecture params.
+        For LLM_GENERATION stages (token2wav): loaded separately.
         """
         self.model_config = model_config
         self.config = model_config
         self.engine_config = engine_config
 
         from rtp_llm.model_factory import ModelFactory
+        import inspect
 
-        primary_created = False
         for stage in self.pipeline_config.stages:
             if stage.execution_type == StageExecutionType.LLM_AR:
-                if primary_created:
-                    logger.info(
-                        f"Stage {stage.stage_id} ({stage.model_stage}) "
-                        f"deferred — only primary stage loaded in Phase 3"
-                    )
-                    continue
-
                 logger.info(
                     f"Initializing LLM_AR stage {stage.stage_id} "
                     f"({stage.model_stage}) with model_type={stage.model_type}"
@@ -142,8 +180,17 @@ class OmniEngine:
 
                 model_cls = ModelFactory.get_model_cls(stage_model_type)
 
+                if self._primary_engine is None:
+                    stage_model_config = model_config
+                    stage_vit_config = vit_config
+                else:
+                    stage_model_config = self._create_stage_model_config(
+                        stage, model_config, engine_config
+                    )
+                    stage_vit_config = None
+
                 from_config_kwargs = dict(
-                    model_config=model_config,
+                    model_config=stage_model_config,
                     parallelism_config=engine_config.parallelism_config,
                     hw_kernel_config=engine_config.hw_kernel_config,
                     kv_cache_config=engine_config.kv_cache_config,
@@ -151,12 +198,11 @@ class OmniEngine:
                     moe_config=engine_config.moe_config,
                     load_method=engine_config.load_config.load_method,
                     max_generate_batch_size=engine_config.runtime_config.max_generate_batch_size,
-                    vit_config=vit_config,
+                    vit_config=stage_vit_config,
                     merge_lora=merge_lora,
                     device_resource_config=engine_config.device_resource_config,
                     force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
                 )
-                import inspect
                 sig = inspect.signature(model_cls.from_config)
                 if 'load_python_model' in sig.parameters:
                     from_config_kwargs['load_python_model'] = True
@@ -173,9 +219,14 @@ class OmniEngine:
                     world_info=world_info,
                 )
                 self.stage_engines[stage.stage_id] = sub_engine
-                if not primary_created:
+
+                if self._primary_engine is None:
                     self._primary_engine = sub_engine
-                    primary_created = True
+
+                if stage.model_stage == "thinker":
+                    self._thinker_engine = sub_engine
+                elif stage.model_stage == "talker":
+                    self._talker_engine = sub_engine
 
                 logger.info(
                     f"Stage {stage.stage_id} ({stage.model_stage}) engine created"
@@ -222,28 +273,25 @@ class OmniEngine:
         return True
 
     def initialize_audio_pipeline(self, ckpt_path: str, audio_device: str = "cuda:0"):
-        """Load talker, token2wav, thinker embeddings, and speaker data for audio generation."""
-        from rtp_llm.omni.models.qwen2_5_omni.talker_inference import TalkerInference
+        """Load talker wrapper, token2wav, and speaker data for audio generation.
+
+        The talker engine is already loaded via initialize_stages() as a
+        LanguageCppEngine. This method creates the TalkerEngineWrapper for
+        generation and loads the remaining audio components.
+        """
+        from rtp_llm.omni.models.qwen2_5_omni.talker_engine_wrapper import TalkerEngineWrapper
         from rtp_llm.omni.models.qwen2_5_omni.token2wav_model import Token2WavModel
 
         logger.info(f"Loading audio pipeline on {audio_device}...")
 
-        self._talker = TalkerInference.from_pretrained(ckpt_path, device=audio_device)
+        if self._talker_engine is None:
+            logger.warning(
+                "Talker engine not loaded — call initialize_stages() first"
+            )
+        else:
+            self._talker_wrapper = TalkerEngineWrapper(self._talker_engine)
+
         self._token2wav = Token2WavModel.from_pretrained(ckpt_path, device=audio_device)
-
-        # Load thinker embedding layer for reconstructing first-layer embeddings
-        from safetensors.torch import load_file
-        index_path = os.path.join(ckpt_path, "model.safetensors.index.json")
-        with open(index_path) as f:
-            index = json.load(f)
-
-        embed_key = "thinker.model.embed_tokens.weight"
-        shard_file = index["weight_map"][embed_key]
-        weights = load_file(os.path.join(ckpt_path, shard_file))
-        embed_weight = weights[embed_key]
-        self._thinker_embed = torch.nn.Embedding(embed_weight.shape[0], embed_weight.shape[1])
-        self._thinker_embed.weight = torch.nn.Parameter(embed_weight)
-        self._thinker_embed = self._thinker_embed.to(device=audio_device, dtype=torch.bfloat16).eval()
 
         # Load speaker data
         spk_path = os.path.join(ckpt_path, "spk_dict.pt")
@@ -262,7 +310,11 @@ class OmniEngine:
 
     @property
     def audio_pipeline_ready(self) -> bool:
-        return self._talker is not None and self._token2wav is not None
+        return (
+            self._talker_engine is not None
+            and hasattr(self, '_talker_wrapper')
+            and self._token2wav is not None
+        )
 
     @torch.no_grad()
     def generate_audio(
@@ -274,7 +326,10 @@ class OmniEngine:
         speaker: str = "Chelsie",
         max_talker_tokens: int = 4096,
     ) -> Optional[torch.Tensor]:
-        """Generate audio waveform from thinker outputs.
+        """Generate audio waveform from thinker outputs via engine-based talker.
+
+        Uses TalkerEngineWrapper which accesses the talker LanguageCppEngine's
+        loaded weights for the custom embedding + projection + transformer pass.
 
         Args:
             text: generated text from thinker
@@ -302,37 +357,24 @@ class OmniEngine:
         dtype = torch.bfloat16
         spk = self._speaker_data[speaker]
 
-        # Build prompt embeddings
-        prompt_ids_t = torch.tensor(prompt_token_ids, dtype=torch.long, device=device)
-        prompt_embeds = self._thinker_embed(prompt_ids_t).unsqueeze(0).to(dtype)
+        # Convert thinker hidden states to tensor
+        thinker_hs = torch.tensor(
+            per_token_hidden_states, dtype=dtype, device=device
+        )
 
-        # Build per-token hidden states and embeddings for generated tokens
-        num_gen = min(len(generated_token_ids), len(per_token_hidden_states))
-        gen_ids_t = torch.tensor(generated_token_ids[:num_gen], dtype=torch.long, device=device)
-        gen_embeds = self._thinker_embed(gen_ids_t).to(dtype)
+        # Initial codec token: speaker BOS token
+        initial_tokens = torch.tensor(
+            [spk["bos_token"]], dtype=torch.long, device=device
+        )
 
-        thinker_hidden_states = [prompt_embeds]
-        thinker_token_embeds = [prompt_embeds.clone()]
-
-        for i in range(num_gen):
-            hs = torch.tensor(per_token_hidden_states[i], dtype=dtype, device=device).unsqueeze(0).unsqueeze(0)
-            emb = gen_embeds[i:i+1].unsqueeze(0)
-            thinker_hidden_states.append(hs)
-            thinker_token_embeds.append(emb)
-
-        input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
-
-        # Generate codec tokens
-        codec_tokens = self._talker.generate(
-            thinker_hidden_states=thinker_hidden_states,
-            thinker_token_embeds=thinker_token_embeds,
-            input_ids=input_ids,
-            speaker_bos_token=spk["bos_token"],
-            thinker_embed_tokens=self._thinker_embed,
+        # Generate codec tokens via talker engine wrapper
+        codec_tokens = self._talker_wrapper.generate(
+            thinker_hidden_states=thinker_hs,
+            initial_token_ids=initial_tokens,
             max_new_tokens=max_talker_tokens,
         )
 
-        # Filter special tokens
+        # Filter special tokens (pad=8292, start=8293, end=8294, etc.)
         mask = codec_tokens[0] < 8292
         codec_filtered = codec_tokens[0][mask].unsqueeze(0)
         if codec_filtered.shape[1] == 0:
@@ -341,7 +383,7 @@ class OmniEngine:
 
         logger.info(f"Generated {codec_filtered.shape[1]} codec tokens")
 
-        # Generate waveform
+        # Generate waveform via token2wav
         waveform = self._token2wav(
             codec_filtered.to(device),
             conditioning=spk["cond"],

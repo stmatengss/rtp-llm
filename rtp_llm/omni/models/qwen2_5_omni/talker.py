@@ -4,7 +4,9 @@ import os
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_factory_register import register_model
+from rtp_llm.model_loader.weight_module import AtomicWeight
 from rtp_llm.models.qwen_v2 import QWenV2, QWenV2Weight
+from rtp_llm.utils.model_weight import CkptWeightInfo, W, identity
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +14,30 @@ logger = logging.getLogger(__name__)
 class Qwen2_5OmniTalkerWeight(QWenV2Weight):
     def __init__(self, **kwargs):
         super().__init__(prefix="talker.", **kwargs)
+
+    def _get_hf_weight_info(self):
+        weights_info = super()._get_hf_weight_info()
+        # Replace lm_head → codec_head
+        for w in weights_info.weights:
+            if w.name == W.lm_head:
+                w.weights = [
+                    CkptWeightInfo(self.prefix + "codec_head.weight", identity)
+                ]
+                break
+        # Add thinker_to_talker_proj (Linear(3584→896) with bias)
+        weights_info.weights.extend([
+            AtomicWeight(
+                "thinker_to_talker_proj.weight",
+                [CkptWeightInfo(self.prefix + "thinker_to_talker_proj.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                "thinker_to_talker_proj.bias",
+                [CkptWeightInfo(self.prefix + "thinker_to_talker_proj.bias", identity)],
+                identity,
+            ),
+        ])
+        return weights_info
 
 
 class Qwen2_5OmniTalker(QWenV2):
@@ -43,7 +69,9 @@ class Qwen2_5OmniTalker(QWenV2):
             "num_key_value_heads", config.attn_config.head_num
         )
         config.attn_config.size_per_head = (
-            talker_config["hidden_size"] // config.attn_config.head_num
+            int(talker_config.get("head_dim"))
+            if "head_dim" in talker_config
+            else talker_config["hidden_size"] // config.attn_config.head_num
         )
         config.hidden_size = talker_config["hidden_size"]
         config.num_layers = talker_config["num_hidden_layers"]

@@ -426,7 +426,7 @@ torch::Tensor RtpLLMOp::generate(torch::Tensor input_ids, int64_t max_new_tokens
         while (true) {
             auto output_result = stream->nextOutput();
             if (!output_result.ok()) {
-                RTP_LLM_LOG_WARNING("Generate stream error: %s", output_result.status().error_message.c_str());
+                RTP_LLM_LOG_WARNING("Generate stream error: %s", output_result.status().ToString().c_str());
                 break;
             }
             auto& outputs = output_result.value();

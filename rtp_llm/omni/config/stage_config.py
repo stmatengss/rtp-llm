@@ -15,6 +15,7 @@ class OmniStageConfig:
     model_stage: str
     execution_type: StageExecutionType
     model_cls: str
+    model_type: Optional[str] = None
     input_sources: Tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: Optional[str] = None

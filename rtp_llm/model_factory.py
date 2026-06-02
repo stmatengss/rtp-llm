@@ -217,6 +217,20 @@ class ModelFactory:
             merge_lora=merge_lora,
         )
 
+        from rtp_llm.omni.engine.omni_engine import OmniEngine
+        if isinstance(model, OmniEngine):
+            logging.info("Initializing OmniEngine stages")
+            model.initialize_stages(
+                model_config=model_config,
+                engine_config=engine_config,
+                world_info=world_info,
+                vit_config=vit_config,
+                merge_lora=merge_lora,
+            )
+            model.start()
+            logging.info("OmniEngine created and started")
+            return model
+
         model_type = model_config.model_type
         if model_type == "fake_model":
             logging.info("create fake_model")

@@ -40,6 +40,11 @@ def create_engine_config(disable_server=True):
     if disable_server:
         server_config.start_port = -100  # negative → skip gRPC bind
 
+    # Reduce KV cache memory so we have room for FMHA workspace
+    kv_cache_config = KVCacheConfig()
+    kv_cache_config.kv_cache_mem_mb = 2048  # 2GB for KV cache, leaves room for activations
+    kv_cache_config.test_block_num = 0
+
     return EngineConfig(
         parallelism_config=ParallelismConfig(),
         runtime_config=RuntimeConfig(),
@@ -48,7 +53,7 @@ def create_engine_config(disable_server=True):
         pd_sep_config=PDSepConfig(),
         concurrency_config=ConcurrencyConfig(),
         fmha_config=FMHAConfig(),
-        kv_cache_config=KVCacheConfig(),
+        kv_cache_config=kv_cache_config,
         profiling_debug_logging_config=ProfilingDebugLoggingConfig(),
         hw_kernel_config=HWKernelConfig(),
         device_resource_config=DeviceResourceConfig(),
@@ -123,6 +128,8 @@ def main():
         force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
     )
     sig = inspect.signature(Qwen2_5OmniTalker.from_config)
+    if 'load_python_model' in sig.parameters:
+        from_config_kwargs['load_python_model'] = True
     if 'skip_python_model' in sig.parameters:
         from_config_kwargs['skip_python_model'] = False
 
@@ -160,10 +167,14 @@ def main():
     spk_dict = torch.load(spk_path, map_location=device)
     speaker_name = list(spk_dict.keys())[0]
     spk = spk_dict[speaker_name]
-    spk_bos = spk["bos_token"]
+    spk_bos = spk["bos_token"]  # thinker speaker token (e.g. 151870 for Ethan)
     cond = spk["cond"].float().to(device)
     ref_mel = spk["ref_mel"].float().to(device)
-    logger.info(f"Speaker: {speaker_name}, BOS: {spk_bos}")
+    logger.info(f"Speaker: {speaker_name}, thinker BOS: {spk_bos}")
+
+    # Talker uses codec BOS (8293), not thinker speaker token
+    TALKER_CODEC_BOS = 8293
+    TALKER_CODEC_EOS = 8294
 
     # Set up thinker hidden states (use random for this test)
     py_model = talker_model.py_model
@@ -174,9 +185,9 @@ def main():
 
     py_model.set_thinker_hidden_states(thinker_hs)
 
-    # Generate codec tokens via C++ engine
-    initial_tokens = torch.tensor([spk_bos], dtype=torch.int32)
-    eos_token_id = 8294  # talker EOS
+    # Generate codec tokens via C++ engine - use talker codec BOS, not thinker speaker token
+    initial_tokens = torch.tensor([TALKER_CODEC_BOS], dtype=torch.int32)
+    eos_token_id = TALKER_CODEC_EOS
 
     logger.info("=== Generating codec tokens via C++ engine ===")
     t0 = time.time()

@@ -1,8 +1,9 @@
 """End-to-end Qwen2.5-Omni benchmark: thinker → talker → token2wav.
 
-Two modes:
+Three modes:
   --mode hf     : Use HuggingFace transformers for the full pipeline (reference)
-  --mode hybrid : Use rtp-llm thinker + rtp-llm talker/token2wav modules
+  --mode hybrid : Use rtp-llm thinker + pure PyTorch talker/token2wav modules (legacy)
+  --mode rtp    : Use rtp-llm thinker + rtp engine-based talker + token2wav
 
 Usage:
     # HF reference (uses HF model.generate() for everything)
@@ -10,7 +11,13 @@ Usage:
         --ckpt /root/models/Qwen/Qwen2.5-Omni-7B \
         --mode hf --prompt "Tell me a joke." --output output_hf.wav
 
-    # Hybrid: rtp-llm thinker (already running on port 18080) + our talker/token2wav
+    # RTP engine mode: rtp-llm thinker + engine-based talker
+    CUDA_VISIBLE_DEVICES=5 python bench_omni_e2e.py \
+        --ckpt /root/models/Qwen/Qwen2.5-Omni-7B \
+        --mode rtp --thinker-url http://localhost:18080 \
+        --prompt "Tell me a joke." --output output_rtp.wav
+
+    # Hybrid (legacy): rtp-llm thinker + pure PyTorch talker
     CUDA_VISIBLE_DEVICES=5 python bench_omni_e2e.py \
         --ckpt /root/models/Qwen/Qwen2.5-Omni-7B \
         --mode hybrid --thinker-url http://localhost:18080 \
@@ -33,7 +40,7 @@ logger = logging.getLogger("bench_omni_e2e")
 
 
 def save_wav(waveform: torch.Tensor, path: str, sample_rate: int = 24000):
-    audio = waveform.squeeze().cpu().float().numpy()
+    audio = waveform.squeeze().detach().cpu().float().numpy()
     audio = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio * 32767).astype(np.int16)
 
@@ -342,10 +349,175 @@ def run_hybrid_mode(args):
     logger.info(f"  Token2Wav: {t_t2w_end - t_t2w_start:.2f}s")
 
 
+def run_rtp_mode(args):
+    """Run e2e with rtp-llm thinker + engine-based talker + token2wav."""
+    from rtp_llm.omni.models.qwen2_5_omni.talker import Qwen2_5OmniTalker
+    from rtp_llm.omni.models.qwen2_5_omni.talker_engine_wrapper import TalkerEngineWrapper
+    from rtp_llm.omni.models.qwen2_5_omni.token2wav_model import Token2WavModel
+    from rtp_llm.ops import (
+        ParallelismConfig, RuntimeConfig, FMHAConfig, DeviceResourceConfig,
+        MoeConfig, NcclCommConfig, PDSepConfig, ConcurrencyConfig,
+        ProfilingDebugLoggingConfig, HWKernelConfig, ModelSpecificConfig,
+        SpeculativeExecutionConfig, CacheStoreConfig, MiscellaneousConfig,
+        ArpcConfig, GrpcConfig,
+    )
+    from rtp_llm.config.kv_cache_config import KVCacheConfig
+    from rtp_llm.config.py_config_modules import ServerConfig, LoadConfig
+    from rtp_llm.config.engine_config import EngineConfig
+    import inspect
+
+    device = args.device
+    t0 = time.time()
+
+    # Create engine config
+    engine_config = EngineConfig(
+        parallelism_config=ParallelismConfig(),
+        runtime_config=RuntimeConfig(),
+        nccl_comm_config=NcclCommConfig(),
+        server_config=ServerConfig(),
+        pd_sep_config=PDSepConfig(),
+        concurrency_config=ConcurrencyConfig(),
+        fmha_config=FMHAConfig(),
+        kv_cache_config=KVCacheConfig(),
+        profiling_debug_logging_config=ProfilingDebugLoggingConfig(),
+        hw_kernel_config=HWKernelConfig(),
+        device_resource_config=DeviceResourceConfig(),
+        moe_config=MoeConfig(),
+        model_specific_config=ModelSpecificConfig(),
+        sp_config=SpeculativeExecutionConfig(),
+        cache_store_config=CacheStoreConfig(),
+        misc_config=MiscellaneousConfig(),
+        arpc_config=ArpcConfig(),
+        grpc_config=GrpcConfig(),
+        load_config=LoadConfig(),
+    )
+
+    # Load talker as rtp engine
+    logger.info("=== Loading talker engine ===")
+    t_load_start = time.time()
+    talker_config = Qwen2_5OmniTalker._create_config(args.ckpt)
+    talker_config.ckpt_path = args.ckpt
+    talker_config.tokenizer_path = args.ckpt
+    talker_config.model_type = "qwen2_5_omni_talker"
+    talker_config.max_seq_len = 2048
+    talker_config.use_kvcache = True
+    talker_config.phy2log_path = ""
+    talker_config.init_precision_config(
+        kv_cache_config=engine_config.kv_cache_config, act_type=None
+    )
+
+    from_config_kwargs = dict(
+        model_config=talker_config,
+        parallelism_config=engine_config.parallelism_config,
+        hw_kernel_config=engine_config.hw_kernel_config,
+        kv_cache_config=engine_config.kv_cache_config,
+        fmha_config=engine_config.fmha_config,
+        moe_config=engine_config.moe_config,
+        load_method=engine_config.load_config.load_method,
+        max_generate_batch_size=engine_config.runtime_config.max_generate_batch_size,
+        vit_config=None, merge_lora=False,
+        device_resource_config=engine_config.device_resource_config,
+        force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
+    )
+    sig = inspect.signature(Qwen2_5OmniTalker.from_config)
+    if 'load_python_model' in sig.parameters:
+        from_config_kwargs['load_python_model'] = True
+    if 'skip_python_model' in sig.parameters:
+        from_config_kwargs['skip_python_model'] = False
+
+    talker_model = Qwen2_5OmniTalker.from_config(**from_config_kwargs)
+
+    class FakeEngine:
+        def __init__(self, model):
+            self.model = model
+
+    wrapper = TalkerEngineWrapper(FakeEngine(talker_model))
+    t1 = time.time()
+    logger.info(f"Talker engine loaded in {t1 - t_load_start:.1f}s")
+
+    # Load token2wav
+    token2wav = Token2WavModel.from_pretrained(args.ckpt, device=device)
+    t2 = time.time()
+    logger.info(f"Token2Wav loaded in {t2 - t1:.1f}s")
+
+    # Load speaker data
+    spk_dict = torch.load(os.path.join(args.ckpt, "spk_dict.pt"), map_location=device)
+    speaker_data = spk_dict[args.speaker]
+    speaker_bos = speaker_data["bos_token"]
+    cond = speaker_data["cond"].float().to(device)
+    ref_mel = speaker_data["ref_mel"].float().to(device)
+    logger.info(f"Speaker: {args.speaker}, BOS: {speaker_bos}")
+
+    # Run thinker via API
+    logger.info("=== Running thinker ===")
+    t_thinker_start = time.time()
+    text, per_token_hs = call_thinker_streaming(args.prompt, args.thinker_url, args.max_thinker_tokens)
+    t_thinker_end = time.time()
+    logger.info(f"Thinker: {t_thinker_end - t_thinker_start:.2f}s, {len(per_token_hs)} tokens")
+
+    if not per_token_hs:
+        logger.error("No hidden states from thinker!")
+        return
+
+    # Convert hidden states to tensor
+    dtype = torch.bfloat16
+    thinker_hs = torch.tensor(per_token_hs, dtype=dtype, device=device)
+    logger.info(f"Thinker hidden states: {thinker_hs.shape}")
+
+    # Run talker via engine wrapper
+    logger.info("=== Running talker (rtp engine) ===")
+    initial_tokens = torch.tensor([speaker_bos], dtype=torch.long, device=device)
+
+    t_talker_start = time.time()
+    codec_tokens = wrapper.generate(
+        thinker_hidden_states=thinker_hs,
+        initial_token_ids=initial_tokens,
+        max_new_tokens=args.max_talker_tokens,
+        eos_token_id=8294,
+    )
+    t_talker_end = time.time()
+    num_codec = codec_tokens.shape[1]
+    logger.info(f"Talker: {t_talker_end - t_talker_start:.2f}s, {num_codec} codec tokens")
+
+    if num_codec == 0:
+        logger.error("No codec tokens generated!")
+        return
+
+    # Filter special tokens
+    mask = codec_tokens[0] < 8292
+    codec_filtered = codec_tokens[0][mask].unsqueeze(0)
+    if codec_filtered.shape[1] == 0:
+        logger.error("All codec tokens were special. No audio.")
+        return
+    logger.info(f"Codec tokens after filter: {codec_filtered.shape[1]}")
+
+    # Run token2wav
+    logger.info("=== Running token2wav ===")
+    t_t2w_start = time.time()
+    with torch.no_grad():
+        waveform = token2wav(codec_filtered.to(device), conditioning=cond, reference_mel=ref_mel)
+    t_t2w_end = time.time()
+
+    save_wav(waveform, args.output)
+
+    total = time.time() - t0
+    logger.info("=== RTP Engine Summary ===")
+    logger.info(f"Prompt: {args.prompt}")
+    logger.info(f"Text: {text[:200]}")
+    logger.info(f"Thinker tokens: {len(per_token_hs)}")
+    logger.info(f"Codec tokens: {num_codec} ({codec_filtered.shape[1]} after filter)")
+    logger.info(f"Audio duration: {waveform.numel() / 24000:.2f}s")
+    logger.info(f"Total time: {total:.2f}s")
+    logger.info(f"  Loading: {t2 - t_load_start:.2f}s")
+    logger.info(f"  Thinker: {t_thinker_end - t_thinker_start:.2f}s")
+    logger.info(f"  Talker: {t_talker_end - t_talker_start:.2f}s")
+    logger.info(f"  Token2Wav: {t_t2w_end - t_t2w_start:.2f}s")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Qwen2.5-Omni end-to-end benchmark")
     parser.add_argument("--ckpt", required=True, help="Model checkpoint path")
-    parser.add_argument("--mode", choices=["hf", "hybrid"], default="hybrid")
+    parser.add_argument("--mode", choices=["hf", "hybrid", "rtp"], default="rtp")
     parser.add_argument("--thinker-url", default="http://localhost:18080")
     parser.add_argument("--prompt", default="Tell me a short joke.")
     parser.add_argument("--speaker", default="Chelsie")
@@ -357,6 +529,8 @@ def main():
 
     if args.mode == "hf":
         run_hf_mode(args)
+    elif args.mode == "rtp":
+        run_rtp_mode(args)
     else:
         run_hybrid_mode(args)
 

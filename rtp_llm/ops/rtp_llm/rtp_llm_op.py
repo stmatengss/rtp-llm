@@ -42,4 +42,9 @@ class RtpLLMOp:
         self.ft_op.stop()  # type: ignore
 
     def generate(self, input_ids, max_new_tokens: int = 4096, eos_token_id: int = -1):
+        if not hasattr(self.ft_op, 'generate'):
+            raise RuntimeError(
+                "C++ RtpLLMOp.generate() not available. "
+                "Rebuild with: bazelisk build //:th_transformer"
+            )
         return self.ft_op.generate(input_ids, max_new_tokens, eos_token_id)

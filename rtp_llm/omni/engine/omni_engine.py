@@ -147,7 +147,7 @@ class OmniEngine:
 
                 model_cls = ModelFactory.get_model_cls(stage_model_type)
 
-                stage_model = model_cls.from_config(
+                from_config_kwargs = dict(
                     model_config=model_config,
                     parallelism_config=engine_config.parallelism_config,
                     hw_kernel_config=engine_config.hw_kernel_config,
@@ -161,6 +161,13 @@ class OmniEngine:
                     device_resource_config=engine_config.device_resource_config,
                     force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
                 )
+                import inspect
+                sig = inspect.signature(model_cls.from_config)
+                if 'load_python_model' in sig.parameters:
+                    from_config_kwargs['load_python_model'] = True
+                if 'skip_python_model' in sig.parameters:
+                    from_config_kwargs['skip_python_model'] = False
+                stage_model = model_cls.from_config(**from_config_kwargs)
 
                 alog_conf_path = engine_config.profiling_debug_logging_config.ft_alog_conf_path
                 from rtp_llm.async_decoder_engine.engine_creator import create_engine

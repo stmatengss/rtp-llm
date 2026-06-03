@@ -409,7 +409,9 @@ RtpLLMOp::generate(torch::Tensor input_ids,
     generate_config->max_new_tokens         = max_new_tokens;
     generate_config->do_sample              = false;
     generate_config->top_k                  = 1;
-    generate_config->is_streaming           = false;
+    // Stream when hidden states are requested so we get one per generated token,
+    // not just the final step.
+    generate_config->is_streaming           = return_hidden_states;
     generate_config->return_output_ids      = true;
     generate_config->return_hidden_states   = return_hidden_states;
     if (eos_token_id >= 0) {
@@ -425,8 +427,13 @@ RtpLLMOp::generate(torch::Tensor input_ids,
     auto stream = engine->enqueue(generate_input);
     RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "Failed to enqueue generate request");
 
-    std::vector<int32_t>         all_output_ids;
-    std::vector<torch::Tensor>   hidden_state_chunks;  // each chunk is [num_new_tokens, hidden_dim]
+    // In non-streaming mode, the engine emits ONE final output with the full cumulative
+    // output_ids. In streaming mode (used when return_hidden_states=true), it emits one
+    // output per step, where each step's output_ids is also cumulative — so we just keep
+    // the latest. Hidden states, however, are per-step: each step's hidden_states tensor
+    // contains the new token's last-layer state; we concatenate them.
+    torch::Tensor                latest_output_ids;
+    std::vector<torch::Tensor>   hidden_state_chunks;
     {
         pybind11::gil_scoped_release release;
         while (true) {
@@ -439,12 +446,7 @@ RtpLLMOp::generate(torch::Tensor input_ids,
             auto& outputs = output_result.value();
             for (auto& output : outputs.generate_outputs) {
                 if (output.output_ids.defined() && output.output_ids.numel() > 0) {
-                    auto ids_cpu  = output.output_ids.cpu().contiguous();
-                    auto data_ptr = ids_cpu.data_ptr<int32_t>();
-                    int64_t total = ids_cpu.numel();
-                    for (int64_t i = 0; i < total; i++) {
-                        all_output_ids.push_back(data_ptr[i]);
-                    }
+                    latest_output_ids = output.output_ids.cpu().contiguous();
                 }
                 if (return_hidden_states && output.hidden_states.has_value()
                     && output.hidden_states->defined()
@@ -460,12 +462,15 @@ RtpLLMOp::generate(torch::Tensor input_ids,
     }
 
     torch::Tensor token_tensor;
-    if (all_output_ids.empty()) {
+    if (!latest_output_ids.defined() || latest_output_ids.numel() == 0) {
         token_tensor = torch::empty({1, 0}, torch::kInt32);
     } else {
-        token_tensor = torch::from_blob(all_output_ids.data(),
-                                        {1, static_cast<int64_t>(all_output_ids.size())},
-                                        torch::kInt32).clone();
+        // Normalize to [1, N]
+        if (latest_output_ids.dim() == 1) {
+            token_tensor = latest_output_ids.unsqueeze(0).to(torch::kInt32);
+        } else {
+            token_tensor = latest_output_ids.to(torch::kInt32);
+        }
     }
 
     torch::Tensor hidden_tensor;

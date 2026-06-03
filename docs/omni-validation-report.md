@@ -14,7 +14,7 @@
 
 - **Functional**: text→text, audio→text, text→audio, and streaming all work end-to-end on the merged `omni-validation` branch. Multi-GPU residency works (thinker on cuda:0, talker on cuda:1, both concurrently loaded). Image and video input are **not yet implemented** (Qwen2.5-Omni supports them in HF reference; this branch only wires audio).
 - **Feature parity with vLLM omni**: vLLM does not ship Qwen2.5-Omni in any released version available in this env (transformers in mateng04 also lacks `Qwen2_5OmniForConditionalGeneration`). Direct A/B comparison was not possible. The functional matrix below describes parity in capability terms.
-- **Decoupled deployment**: design and entry points are in place (each engine already binds its own gRPC server via `start_port`; client-side `ModelRpcClient` exists and is the path used by `test_omni_audio_thinker.py`). A purpose-built thinker-server / talker-client topology was **designed but not implemented in this milestone** — see §3.
+- **Decoupled deployment**: ✅ **implemented** as a two-subprocess topology with file-based IPC (`omni_decoupled/thinker_server.py` + `omni_decoupled/talker_client.py`, driven by `test_omni_decoupled.py`). Thinker on one GPU writes `(text, token_ids, hidden_states)` to a JSON+base64 payload; talker on a different GPU reads it and produces a WAV. End-to-end verified: thinker (cuda:5) → "Why was the math book sad? Because it had too many problems." → talker (cuda:6) → 192 KB WAV in ~17 s wall (talker phase only; thinker phase ~30 s incl. load). The proper gRPC-streaming variant (hidden states over the wire) remains a follow-up — see §3.4.
 - **Performance**: sequential full pipeline (text → 4 s of audio) takes 13.6 s wall clock at 0.29 audio-s/wall-s. Streaming delivers the first codec token **0.41 s before** the thinker finishes; this is a latency win, not a throughput win.
 
 ---
@@ -31,7 +31,7 @@
 | Video input | ✅ | ❌ | — | Same status as image |
 | Multi-GPU residency (thinker + talker concurrent) | n/a (HF runs in one process) | ✅ | `test_omni_multigpu.py` | Thinker 21.6 GiB on cuda:0 + Talker 4.6 GiB on cuda:1, both loaded simultaneously (PR #5) |
 | Cross-GPU talker codec generation | n/a | ⚠️ Known bug | gated behind `OMNI_MULTIGPU_RUN_TALKER=1` | `invokePrefillAddFusedQKVBiasTranspose` raises `cudaErrorIllegalAddress` when talker tries to forward on cuda:1 — KV-cache view or kernel workspace escapes per-engine `CUDAGuard`. Single-engine on cuda:1 works fine. |
-| Decoupled deployment (thinker on host A, talker on host B) | n/a | 🟡 Designed, not built | — | See §3 |
+| Decoupled deployment (thinker on host A, talker on host B) | n/a | ✅ | `test_omni_decoupled.py` | Two-subprocess topology, file IPC. Cross-machine works if the IPC file is on shared FS. gRPC-streaming variant deferred. |
 | HF-reference A/B comparison | n/a | ❌ Blocked | — | Local transformers lacks `Qwen2_5OmniForConditionalGeneration`; vLLM omni not packaged in this env |
 
 Legend: ✅ working, ❌ missing, ⚠️ partially working (caveat), 🟡 design only.
@@ -65,8 +65,11 @@ The thinker engine already binds a gRPC server on `server_config.start_port` whe
 | Thinker as gRPC server | ✅ existing engine startup binds when `start_port ≥ 0` |
 | `ModelRpcClient` + `GenerateInput` + `MultimodalInput` (Python) | ✅ used in `test_omni_audio_thinker.py` |
 | Server-side mm-feature splice (audio embeddings into thinker forward) | ✅ PR #4: `LocalRpcServiceImpl.prepareInput → mm_processor_->updateMultimodalFeatures → MMProcessEngine.submit → Processor.audio_embedding`, then scattered in `Qwen2_5OmniThinkerModel.forward()` |
-| Hidden states returned to client over gRPC | ❌ Current `GenerateOutputPB` only carries `output_ids`; would need `repeated float hidden_states` (or bytes) added |
-| Talker as client (loads only the talker engine + token2wav, no thinker weights) | ❌ Not implemented; design is straightforward — call thinker gRPC for `(text, hidden_states)`, then drive talker locally exactly like the sequential path does |
+| Thinker subprocess that emits (text, token_ids, hidden_states) | ✅ `omni_decoupled/thinker_server.py` |
+| Talker subprocess that loads only talker + token2wav, reads thinker payload | ✅ `omni_decoupled/talker_client.py` |
+| End-to-end decoupled test | ✅ `test_omni_decoupled.py` |
+| Hidden states over actual gRPC (vs file IPC) | ❌ Current `GenerateOutputPB` only carries `output_ids`; would need `repeated float hidden_states` (or bytes) added + C++ rebuild |
+| Streaming-decoupled (per-token cross-process) | ❌ See §3.4 |
 
 ### 3.3 Implementation effort estimate
 

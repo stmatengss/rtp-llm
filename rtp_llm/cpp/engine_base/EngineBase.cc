@@ -27,8 +27,15 @@ void EngineBase::initRuntime(const EngineInitParams& params) {
         params.parallelism_config.dp_rank * params.parallelism_config.tp_size + params.parallelism_config.tp_rank;
     Logger::getEngineLogger().setRank(rank);
     Logger::getEngineLogger().flush();
-    size_t device_id = params.parallelism_config.world_rank % params.parallelism_config.local_world_size;
-    mla_ops_type_    = rtp_llm::initRuntime(device_id,
+    // Per-engine device id. The standard formula assigns one GPU per local rank.
+    // For multi-stage models (e.g. Qwen Omni thinker+talker) running in one process
+    // on different GPUs, the caller sets per-stage parallelism_config with distinct
+    // world_rank values and local_world_size >= num_stages, so each engine gets a
+    // distinct device_id and rtp_llm::initRuntime switches the current thread's
+    // device before this engine's allocations happen.
+    device_id_ = static_cast<int64_t>(
+        params.parallelism_config.world_rank % params.parallelism_config.local_world_size);
+    mla_ops_type_ = rtp_llm::initRuntime(static_cast<size_t>(device_id_),
                                          params.profiling_debug_logging_config.trace_memory,
                                          params.device_resource_config.enable_comm_overlap,
                                          params.model_config_.mla_ops_type);

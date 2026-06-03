@@ -1,3 +1,5 @@
+import contextlib
+import copy
 import json
 import logging
 import os
@@ -16,6 +18,13 @@ from rtp_llm.omni.engine.stage_connector import SharedMemoryConnector, StageConn
 from rtp_llm.omni.engine.stage_pool import OmniStagePool
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _noop_ctx():
+    """No-op context manager: lets the same `with` form serve single- and
+    multi-GPU paths without branching the surrounding code."""
+    yield
 
 
 class OmniEngine:
@@ -143,6 +152,38 @@ class OmniEngine:
         )
         return stage_config
 
+    def _per_stage_engine_config(
+        self,
+        engine_config: Any,
+        stage_index: int,
+        num_llm_ar_stages: int,
+    ) -> Any:
+        """Clone engine_config and pin its parallelism to a specific GPU.
+
+        With multi_gpu=True, each LLM_AR stage gets its own GPU index in
+        [0, num_llm_ar_stages). We adjust parallelism_config so:
+          - Python weight loader uses cuda:{stage_index}
+            (BaseModel._get_device_str uses parallelism_config.local_rank)
+          - C++ EngineBase computes device_id_ = world_rank % local_world_size
+            = stage_index (with local_world_size == num_llm_ar_stages)
+        Both knobs end up on the same GPU. Returns a shallow copy of
+        engine_config with a freshly-tweaked parallelism_config; other
+        sub-configs are shared (they are stateless w.r.t. device).
+        """
+        new_pc = copy.copy(engine_config.parallelism_config)
+        new_pc.tp_size = 1
+        new_pc.tp_rank = 0
+        new_pc.dp_size = 1
+        new_pc.dp_rank = 0
+        new_pc.world_size = num_llm_ar_stages
+        new_pc.world_rank = stage_index
+        new_pc.local_world_size = num_llm_ar_stages
+        new_pc.local_rank = stage_index
+
+        new_cfg = copy.copy(engine_config)
+        new_cfg.parallelism_config = new_pc
+        return new_cfg
+
     def initialize_stages(
         self,
         model_config: Any,
@@ -150,12 +191,20 @@ class OmniEngine:
         world_info: Any,
         vit_config: Any = None,
         merge_lora: bool = False,
+        multi_gpu: bool = False,
     ) -> None:
         """Create per-stage sub-engines.
 
         For LLM_AR stages: creates a full LanguageCppEngine via the standard path.
         Each stage gets its own ModelConfig with stage-specific architecture params.
         For LLM_GENERATION stages (token2wav): loaded separately.
+
+        Args:
+            multi_gpu: when True, assign each LLM_AR stage to its own GPU index
+                (stage 0 → cuda:0, stage 1 → cuda:1, ...). The caller is
+                responsible for exposing enough GPUs (e.g. CUDA_VISIBLE_DEVICES).
+                When False, all stages share whatever device the base
+                engine_config selects (single-GPU mode).
         """
         self.model_config = model_config
         self.config = model_config
@@ -164,6 +213,20 @@ class OmniEngine:
         from rtp_llm.model_factory import ModelFactory
         import inspect
 
+        # Count LLM_AR stages so we can compute per-stage device indices for
+        # multi_gpu mode. token2wav stages don't consume a slot here.
+        llm_ar_stages = [
+            s for s in self.pipeline_config.stages
+            if s.execution_type == StageExecutionType.LLM_AR
+        ]
+        num_llm_ar = len(llm_ar_stages)
+        if multi_gpu and torch.cuda.device_count() < num_llm_ar:
+            raise RuntimeError(
+                f"multi_gpu=True needs >= {num_llm_ar} visible CUDA devices "
+                f"(one per LLM_AR stage); got {torch.cuda.device_count()}."
+            )
+
+        llm_ar_index = 0
         for stage in self.pipeline_config.stages:
             if stage.execution_type == StageExecutionType.LLM_AR:
                 logger.info(
@@ -189,35 +252,51 @@ class OmniEngine:
                     )
                     stage_vit_config = None
 
+                # In multi_gpu mode, build a per-stage engine_config pinned to
+                # this stage's GPU. Otherwise reuse the caller's config.
+                if multi_gpu:
+                    stage_engine_config = self._per_stage_engine_config(
+                        engine_config, llm_ar_index, num_llm_ar
+                    )
+                else:
+                    stage_engine_config = engine_config
+
                 from_config_kwargs = dict(
                     model_config=stage_model_config,
-                    parallelism_config=engine_config.parallelism_config,
-                    hw_kernel_config=engine_config.hw_kernel_config,
-                    kv_cache_config=engine_config.kv_cache_config,
-                    fmha_config=engine_config.fmha_config,
-                    moe_config=engine_config.moe_config,
-                    load_method=engine_config.load_config.load_method,
-                    max_generate_batch_size=engine_config.runtime_config.max_generate_batch_size,
+                    parallelism_config=stage_engine_config.parallelism_config,
+                    hw_kernel_config=stage_engine_config.hw_kernel_config,
+                    kv_cache_config=stage_engine_config.kv_cache_config,
+                    fmha_config=stage_engine_config.fmha_config,
+                    moe_config=stage_engine_config.moe_config,
+                    load_method=stage_engine_config.load_config.load_method,
+                    max_generate_batch_size=stage_engine_config.runtime_config.max_generate_batch_size,
                     vit_config=stage_vit_config,
                     merge_lora=merge_lora,
-                    device_resource_config=engine_config.device_resource_config,
-                    force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
+                    device_resource_config=stage_engine_config.device_resource_config,
+                    force_cpu_load_weights=stage_engine_config.load_config.force_cpu_load_weights,
                 )
                 sig = inspect.signature(model_cls.from_config)
                 if 'load_python_model' in sig.parameters:
                     from_config_kwargs['load_python_model'] = True
                 if 'skip_python_model' in sig.parameters:
                     from_config_kwargs['skip_python_model'] = False
-                stage_model = model_cls.from_config(**from_config_kwargs)
 
-                alog_conf_path = engine_config.profiling_debug_logging_config.ft_alog_conf_path
-                from rtp_llm.async_decoder_engine.engine_creator import create_engine
-                sub_engine = create_engine(
-                    model=stage_model,
-                    engine_config=engine_config,
-                    alog_conf_path=alog_conf_path,
-                    world_info=world_info,
-                )
+                # Pin the construction thread to the stage's GPU so any
+                # incidental main-thread CUDA work (capability probes,
+                # Python weight load) targets the right device.
+                stage_device = stage_engine_config.parallelism_config.local_rank
+                ctx = torch.cuda.device(stage_device) if multi_gpu else _noop_ctx()
+                with ctx:
+                    stage_model = model_cls.from_config(**from_config_kwargs)
+
+                    alog_conf_path = stage_engine_config.profiling_debug_logging_config.ft_alog_conf_path
+                    from rtp_llm.async_decoder_engine.engine_creator import create_engine
+                    sub_engine = create_engine(
+                        model=stage_model,
+                        engine_config=stage_engine_config,
+                        alog_conf_path=alog_conf_path,
+                        world_info=world_info,
+                    )
                 self.stage_engines[stage.stage_id] = sub_engine
 
                 if self._primary_engine is None:
@@ -230,7 +309,9 @@ class OmniEngine:
 
                 logger.info(
                     f"Stage {stage.stage_id} ({stage.model_stage}) engine created"
+                    + (f" on cuda:{stage_device}" if multi_gpu else "")
                 )
+                llm_ar_index += 1
 
             elif stage.execution_type == StageExecutionType.LLM_GENERATION:
                 logger.info(

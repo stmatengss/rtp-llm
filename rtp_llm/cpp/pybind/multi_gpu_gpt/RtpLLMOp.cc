@@ -397,47 +397,59 @@ void RtpLLMOp::restart() {
     engine->restart();
 }
 
-torch::Tensor RtpLLMOp::generate(torch::Tensor input_ids, int64_t max_new_tokens, int64_t eos_token_id) {
+std::tuple<torch::Tensor, torch::Tensor>
+RtpLLMOp::generate(torch::Tensor input_ids,
+                   int64_t       max_new_tokens,
+                   int64_t       eos_token_id,
+                   bool          return_hidden_states) {
     auto engine = model_rpc_service_->getEngine();
     RTP_LLM_CHECK_WITH_INFO(engine != nullptr, "Engine not initialized");
 
     auto generate_config = std::make_shared<GenerateConfig>();
-    generate_config->max_new_tokens = max_new_tokens;
-    generate_config->do_sample = false;
-    generate_config->top_k = 1;
-    generate_config->is_streaming = false;
-    generate_config->return_output_ids = true;
+    generate_config->max_new_tokens         = max_new_tokens;
+    generate_config->do_sample              = false;
+    generate_config->top_k                  = 1;
+    generate_config->is_streaming           = false;
+    generate_config->return_output_ids      = true;
+    generate_config->return_hidden_states   = return_hidden_states;
     if (eos_token_id >= 0) {
         generate_config->stop_words_list.push_back({static_cast<int>(eos_token_id)});
     }
 
     static std::atomic<int64_t> request_counter{100000};
-    auto generate_input = std::make_shared<GenerateInput>();
-    generate_input->input_ids = input_ids.to(torch::kInt32).contiguous();
+    auto generate_input             = std::make_shared<GenerateInput>();
+    generate_input->input_ids       = input_ids.to(torch::kInt32).contiguous();
     generate_input->generate_config = generate_config;
-    generate_input->request_id = request_counter.fetch_add(1);
+    generate_input->request_id      = request_counter.fetch_add(1);
 
     auto stream = engine->enqueue(generate_input);
     RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "Failed to enqueue generate request");
 
-    std::vector<int32_t> all_output_ids;
+    std::vector<int32_t>         all_output_ids;
+    std::vector<torch::Tensor>   hidden_state_chunks;  // each chunk is [num_new_tokens, hidden_dim]
     {
         pybind11::gil_scoped_release release;
         while (true) {
             auto output_result = stream->nextOutput();
             if (!output_result.ok()) {
-                RTP_LLM_LOG_WARNING("Generate stream error: %s", output_result.status().ToString().c_str());
+                RTP_LLM_LOG_WARNING("Generate stream error: %s",
+                                    output_result.status().ToString().c_str());
                 break;
             }
             auto& outputs = output_result.value();
             for (auto& output : outputs.generate_outputs) {
                 if (output.output_ids.defined() && output.output_ids.numel() > 0) {
-                    auto ids_cpu = output.output_ids.cpu().contiguous();
+                    auto ids_cpu  = output.output_ids.cpu().contiguous();
                     auto data_ptr = ids_cpu.data_ptr<int32_t>();
                     int64_t total = ids_cpu.numel();
                     for (int64_t i = 0; i < total; i++) {
                         all_output_ids.push_back(data_ptr[i]);
                     }
+                }
+                if (return_hidden_states && output.hidden_states.has_value()
+                    && output.hidden_states->defined()
+                    && output.hidden_states->numel() > 0) {
+                    hidden_state_chunks.push_back(output.hidden_states->cpu().contiguous());
                 }
                 if (output.finished) {
                     goto done;
@@ -447,13 +459,23 @@ torch::Tensor RtpLLMOp::generate(torch::Tensor input_ids, int64_t max_new_tokens
         done:;
     }
 
+    torch::Tensor token_tensor;
     if (all_output_ids.empty()) {
-        return torch::empty({1, 0}, torch::kInt32);
+        token_tensor = torch::empty({1, 0}, torch::kInt32);
+    } else {
+        token_tensor = torch::from_blob(all_output_ids.data(),
+                                        {1, static_cast<int64_t>(all_output_ids.size())},
+                                        torch::kInt32).clone();
     }
-    auto result = torch::from_blob(all_output_ids.data(),
-                                   {1, static_cast<int64_t>(all_output_ids.size())},
-                                   torch::kInt32).clone();
-    return result;
+
+    torch::Tensor hidden_tensor;
+    if (hidden_state_chunks.empty()) {
+        hidden_tensor = torch::empty({0, 0});
+    } else {
+        hidden_tensor = torch::cat(hidden_state_chunks, /*dim=*/0);
+    }
+
+    return std::make_tuple(token_tensor, hidden_tensor);
 }
 
 void registerRtpLLMOp(const py::module& m) {
@@ -478,7 +500,8 @@ void registerRtpLLMOp(const py::module& m) {
              &RtpLLMOp::generate,
              py::arg("input_ids"),
              py::arg("max_new_tokens"),
-             py::arg("eos_token_id"));
+             py::arg("eos_token_id"),
+             py::arg("return_hidden_states") = false);
 }
 
 }  // namespace rtp_llm

@@ -567,13 +567,31 @@ MlaOpsType initRuntime(size_t device_id, bool trace_memory, bool enable_comm_ove
     RTP_LLM_LOG_INFO("initRuntime: set current thread device to %zu", device_id);
     check_cuda_value(cudaSetDevice(device_id));
     at::cuda::set_device(static_cast<c10::DeviceIndex>(device_id));
+
+    // Force PyTorch's lazy CUDA state for this device to initialize NOW,
+    // before we start allocating engine memory and spawning loop threads
+    // for it. Without this, the second-and-later devices in a multi-GPU
+    // process get half-initialized state (cuBLAS handle pool, default
+    // stream pool, workspace) which surfaces later as
+    // CUBLAS_STATUS_EXECUTION_FAILED / illegal-memory-access in custom
+    // CUDA kernels writing into KV-cache views. Touching getDeviceProperties
+    // + a no-op tensor allocation on the device performs the full lazy init
+    // (mirrors what std::call_once does for the FIRST device).
+    auto* prop = at::cuda::getDeviceProperties(static_cast<c10::DeviceIndex>(device_id));
+    (void)prop;
+    {
+        auto warm = torch::empty(
+            {1},
+            torch::TensorOptions().dtype(torch::kInt8).device(
+                torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_id))));
+        (void)warm;
+    }
     at::cuda::setCurrentCUDAStream(at::cuda::getDefaultCUDAStream(device_id));
 
     // Resolve AUTO for callers after the first one (call_once already
     // resolved AUTO for the first caller; subsequent callers must resolve
     // their own AUTO requests here using the device they actually run on).
     if (resolved_mla_ops_type == MlaOpsType::AUTO) {
-        auto* prop            = at::cuda::getDeviceProperties(static_cast<c10::DeviceIndex>(device_id));
         resolved_mla_ops_type = prop->major >= 9 ? MlaOpsType::FLASH_MLA : MlaOpsType::FLASH_INFER;
     }
 #elif USING_ROCM

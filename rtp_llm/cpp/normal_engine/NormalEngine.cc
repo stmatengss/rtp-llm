@@ -381,8 +381,12 @@ absl::Status NormalEngine::stop() {
 
 void NormalEngine::loop() {
     RTP_LLM_PROFILE_FUNCTION();
-    RTP_LLM_LOG_INFO("loop begin");
-    cudaPreRun(getDeviceId());
+    // Use the per-engine device (EngineBase::device_id_) rather than the
+    // process-global getDeviceId(). With multiple engines coexisting on
+    // different GPUs (Qwen Omni thinker on cuda:0, talker on cuda:1), the
+    // global only reflects whichever engine initialized first.
+    RTP_LLM_LOG_INFO("loop begin (device_id=%ld)", device_id_);
+    cudaPreRun(static_cast<int>(device_id_));
     while (running_) {
         auto status = step();
         if (!status.ok()) {

@@ -90,6 +90,14 @@ public:
 
     std::shared_ptr<KVCacheManager> getCacheManager() const;
 
+    // The CUDA/HIP device this engine is bound to (computed in initRuntime
+    // from parallelism_config). Read by the engine loop and by callers that
+    // need to scope CUDA operations to the right GPU when multiple engines
+    // coexist in one process (Qwen Omni multi-stage: thinker + talker).
+    int64_t deviceId() const {
+        return device_id_;
+    }
+
 protected:
     ResourceContext                resource_context_;
     MlaOpsType                     mla_ops_type_       = MlaOpsType::AUTO;
@@ -97,6 +105,7 @@ protected:
     std::vector<int32_t>           kv_cache_layer_to_group_;
     std::unique_ptr<SchedulerBase> scheduler_ = nullptr;
     bool                           pause_     = false;
+    int64_t                        device_id_ = 0;
 };
 
 }  // namespace rtp_llm

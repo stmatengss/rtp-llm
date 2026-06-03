@@ -503,6 +503,113 @@ RtpLLMOp::generate(torch::Tensor input_ids,
     return std::make_tuple(token_tensor, hidden_tensor);
 }
 
+std::tuple<torch::Tensor, torch::Tensor>
+RtpLLMOp::generateWithCallback(torch::Tensor input_ids,
+                               int64_t       max_new_tokens,
+                               int64_t       eos_token_id,
+                               py::object    callback) {
+    auto engine = model_rpc_service_->getEngine();
+    RTP_LLM_CHECK_WITH_INFO(engine != nullptr, "Engine not initialized");
+    RTP_LLM_CHECK_WITH_INFO(!callback.is_none(),
+                            "generateWithCallback requires a non-None callback");
+
+    auto generate_config                    = std::make_shared<GenerateConfig>();
+    generate_config->max_new_tokens         = max_new_tokens;
+    generate_config->do_sample              = false;
+    generate_config->top_k                  = 1;
+    // Always stream so we can dispatch per-step.
+    generate_config->is_streaming           = true;
+    generate_config->return_output_ids      = true;
+    generate_config->return_hidden_states   = true;
+    if (eos_token_id >= 0) {
+        generate_config->stop_words_list.push_back({static_cast<int>(eos_token_id)});
+    }
+
+    static std::atomic<int64_t> request_counter{200000};
+    auto generate_input             = std::make_shared<GenerateInput>();
+    generate_input->input_ids       = input_ids.to(torch::kInt32).contiguous();
+    generate_input->generate_config = generate_config;
+    generate_input->request_id      = request_counter.fetch_add(1);
+
+    auto stream = engine->enqueue(generate_input);
+    RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "Failed to enqueue generate request");
+
+    std::vector<int32_t>       all_output_ids;
+    std::vector<torch::Tensor> hidden_state_chunks;
+
+    {
+        pybind11::gil_scoped_release release;
+        while (true) {
+            auto output_result = stream->nextOutput();
+            if (!output_result.ok()) {
+                RTP_LLM_LOG_WARNING("Generate stream error: %s",
+                                    output_result.status().ToString().c_str());
+                break;
+            }
+            auto& outputs = output_result.value();
+            for (auto& output : outputs.generate_outputs) {
+                torch::Tensor token_chunk;
+                torch::Tensor hs_chunk;
+                if (output.output_ids.defined() && output.output_ids.numel() > 0) {
+                    token_chunk = output.output_ids.cpu().contiguous().to(torch::kInt32);
+                    auto    data_ptr = token_chunk.data_ptr<int32_t>();
+                    int64_t total    = token_chunk.numel();
+                    for (int64_t i = 0; i < total; i++) {
+                        all_output_ids.push_back(data_ptr[i]);
+                    }
+                }
+                if (output.hidden_states.has_value()
+                    && output.hidden_states->defined()
+                    && output.hidden_states->numel() > 0) {
+                    hs_chunk = output.hidden_states->cpu().contiguous();
+                    hidden_state_chunks.push_back(hs_chunk);
+                }
+                bool finished = output.finished;
+                {
+                    // Acquire GIL only to dispatch the callback. Caller controls
+                    // its own latency from here; we re-release the GIL on scope exit.
+                    pybind11::gil_scoped_acquire acquire;
+                    try {
+                        // None tensors signal "no payload this step".
+                        py::object py_tokens = token_chunk.defined() && token_chunk.numel() > 0
+                                                 ? py::cast(token_chunk)
+                                                 : py::object(py::none());
+                        py::object py_hidden = hs_chunk.defined() && hs_chunk.numel() > 0
+                                                 ? py::cast(hs_chunk)
+                                                 : py::object(py::none());
+                        callback(py_tokens, py_hidden, finished);
+                    } catch (const py::error_already_set& e) {
+                        RTP_LLM_LOG_WARNING("generateWithCallback callback raised: %s", e.what());
+                    } catch (const std::exception& e) {
+                        RTP_LLM_LOG_WARNING("generateWithCallback callback std exception: %s",
+                                            e.what());
+                    }
+                }
+                if (finished) {
+                    goto done;
+                }
+            }
+        }
+        done:;
+    }
+
+    torch::Tensor token_tensor;
+    if (all_output_ids.empty()) {
+        token_tensor = torch::empty({1, 0}, torch::kInt32);
+    } else {
+        token_tensor = torch::from_blob(all_output_ids.data(),
+                                        {1, static_cast<int64_t>(all_output_ids.size())},
+                                        torch::kInt32).clone();
+    }
+    torch::Tensor hidden_tensor;
+    if (hidden_state_chunks.empty()) {
+        hidden_tensor = torch::empty({0, 0});
+    } else {
+        hidden_tensor = torch::cat(hidden_state_chunks, /*dim=*/0);
+    }
+    return std::make_tuple(token_tensor, hidden_tensor);
+}
+
 void registerRtpLLMOp(const py::module& m) {
     pybind11::class_<RtpLLMOp>(m, "RtpLLMOp")
         .def(pybind11::init<>())
@@ -526,7 +633,13 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("input_ids"),
              py::arg("max_new_tokens"),
              py::arg("eos_token_id"),
-             py::arg("return_hidden_states") = false);
+             py::arg("return_hidden_states") = false)
+        .def("generate_with_callback",
+             &RtpLLMOp::generateWithCallback,
+             py::arg("input_ids"),
+             py::arg("max_new_tokens"),
+             py::arg("eos_token_id"),
+             py::arg("callback"));
 }
 
 }  // namespace rtp_llm

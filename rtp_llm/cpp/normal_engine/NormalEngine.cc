@@ -20,6 +20,7 @@
 
 #if USING_CUDA
 #include "c10/cuda/CUDACachingAllocator.h"
+#include "c10/cuda/CUDAGuard.h"
 #endif
 
 #ifdef __linux__

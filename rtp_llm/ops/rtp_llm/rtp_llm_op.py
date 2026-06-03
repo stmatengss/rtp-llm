@@ -43,9 +43,31 @@ class RtpLLMOp:
 
     def generate(self, input_ids, max_new_tokens: int = 4096, eos_token_id: int = -1,
                  return_hidden_states: bool = False):
+        """Generate tokens via the C++ engine.
+
+        Args:
+            input_ids: 1D int32 tensor of prompt tokens.
+            max_new_tokens: cap on tokens to generate.
+            eos_token_id: stop word id (-1 to disable).
+            return_hidden_states: if True, also return per-token last-layer
+                hidden states from the model.
+
+        Returns:
+            If return_hidden_states=False (default):
+                token_ids: [1, num_generated] int32 tensor (cumulative).
+            If return_hidden_states=True:
+                (token_ids, hidden_states) tuple, where hidden_states is
+                [num_generated, hidden_dim] (one row per generated token).
+        """
         if not hasattr(self.ft_op, 'generate'):
             raise RuntimeError(
                 "C++ RtpLLMOp.generate() not available. "
                 "Rebuild with: bazelisk build //:th_transformer"
             )
-        return self.ft_op.generate(input_ids, max_new_tokens, eos_token_id, return_hidden_states)
+        result = self.ft_op.generate(input_ids, max_new_tokens, eos_token_id, return_hidden_states)
+        # C++ always returns (token_ids, hidden_states); unwrap when not requested
+        # for backwards compatibility.
+        if return_hidden_states:
+            return result
+        token_ids, _ = result
+        return token_ids

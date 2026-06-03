@@ -182,12 +182,20 @@ def main():
     input_ids = torch.tensor(prompt_ids, dtype=torch.int32)
     eos_token_id = tokenizer.eos_token_id or 151643
     t0 = time.time()
-    output_tokens = thinker_engine.rtp_llm_op_.generate(
-        input_ids, max_new_tokens=64, eos_token_id=eos_token_id
+    output_tokens, thinker_hs_real = thinker_engine.rtp_llm_op_.generate(
+        input_ids, max_new_tokens=64, eos_token_id=eos_token_id,
+        return_hidden_states=True,
     )
     gen_time = time.time() - t0
     num_gen = output_tokens.shape[1] if output_tokens.numel() > 0 else 0
     logger.info(f"Thinker generated {num_gen} tokens in {gen_time:.2f}s")
+    logger.info(
+        f"Thinker hidden_states captured: shape={tuple(thinker_hs_real.shape)} "
+        f"dtype={thinker_hs_real.dtype}"
+    )
+    assert thinker_hs_real.shape[0] == num_gen, (
+        f"hidden_states rows ({thinker_hs_real.shape[0]}) != num_gen ({num_gen})"
+    )
     if num_gen > 0:
         gen_ids = output_tokens[0].tolist()
         gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -219,10 +227,13 @@ def main():
     # In a real impl we'd capture thinker hidden states during generation.
     # For this all-stages test, we use realistic random hidden states sized
     # to match the number of thinker tokens (prompt + generated).
-    num_thinker_tokens = len(prompt_ids) + num_gen
+    # Use the real thinker hidden states captured during generation.
+    # NOTE: this is only the hidden_states for generated tokens, not the prompt.
+    # The talker's per-step indexing in Qwen2_5OmniTalkerModel handles padding
+    # by repeating the last hidden state if indexed past the end.
     dtype = torch.bfloat16
-    thinker_hs = torch.randn(num_thinker_tokens, 3584, dtype=dtype, device=device)
-    logger.info(f"Thinker hidden states: {thinker_hs.shape} (placeholder)")
+    thinker_hs = thinker_hs_real.to(device=device, dtype=dtype)
+    logger.info(f"Thinker hidden states (REAL): shape={tuple(thinker_hs.shape)}")
 
     py_model.set_thinker_hidden_states(thinker_hs)
 
@@ -251,6 +262,7 @@ def main():
 
     # Free talker engine before loading token2wav
     logger.info("Stopping talker engine to free GPU for token2wav...")
+    talker_hs_shape = tuple(thinker_hs.shape)  # capture for the final summary
     talker_engine.stop()
     del talker_engine, talker_model, py_model, thinker_hs
     gc.collect()
@@ -287,8 +299,8 @@ def main():
     save_wav(waveform, "/root/test_omni_all_stages.wav")
 
     logger.info("\n" + "=" * 70)
-    logger.info("E2E ALL-STAGES TEST PASSED")
-    logger.info(f"  Thinker:  {num_gen} tokens via RTP engine generate()")
+    logger.info("E2E ALL-STAGES TEST PASSED (with REAL thinker hidden states)")
+    logger.info(f"  Thinker:  {num_gen} tokens, hidden_states {talker_hs_shape}")
     logger.info(f"  Talker:   {num_codec} codec tokens via RTP engine generate()")
     logger.info(f"  Audio:    {duration:.2f}s WAV via token2wav")
     logger.info("=" * 70)

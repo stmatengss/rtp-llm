@@ -427,12 +427,14 @@ RtpLLMOp::generate(torch::Tensor input_ids,
     auto stream = engine->enqueue(generate_input);
     RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "Failed to enqueue generate request");
 
-    // In non-streaming mode, the engine emits ONE final output with the full cumulative
-    // output_ids. In streaming mode (used when return_hidden_states=true), it emits one
-    // output per step, where each step's output_ids is also cumulative — so we just keep
-    // the latest. Hidden states, however, are per-step: each step's hidden_states tensor
-    // contains the new token's last-layer state; we concatenate them.
-    torch::Tensor                latest_output_ids;
+    // Modes:
+    //   - non-streaming (return_hidden_states=false): engine emits ONE final
+    //     output with the full cumulative output_ids. We keep that one.
+    //   - streaming (return_hidden_states=true): one output per step. Each step's
+    //     output_ids contains only the NEW token, and hidden_states contains the
+    //     last-layer state for that new token. We accumulate both.
+    std::vector<int32_t>         all_output_ids;
+    torch::Tensor                cumulative_output_ids;
     std::vector<torch::Tensor>   hidden_state_chunks;
     {
         pybind11::gil_scoped_release release;
@@ -446,7 +448,18 @@ RtpLLMOp::generate(torch::Tensor input_ids,
             auto& outputs = output_result.value();
             for (auto& output : outputs.generate_outputs) {
                 if (output.output_ids.defined() && output.output_ids.numel() > 0) {
-                    latest_output_ids = output.output_ids.cpu().contiguous();
+                    auto ids_cpu = output.output_ids.cpu().contiguous().to(torch::kInt32);
+                    if (return_hidden_states) {
+                        // streaming: append the new tokens
+                        auto data_ptr = ids_cpu.data_ptr<int32_t>();
+                        int64_t total = ids_cpu.numel();
+                        for (int64_t i = 0; i < total; i++) {
+                            all_output_ids.push_back(data_ptr[i]);
+                        }
+                    } else {
+                        // non-streaming: keep latest cumulative
+                        cumulative_output_ids = ids_cpu;
+                    }
                 }
                 if (return_hidden_states && output.hidden_states.has_value()
                     && output.hidden_states->defined()
@@ -462,14 +475,21 @@ RtpLLMOp::generate(torch::Tensor input_ids,
     }
 
     torch::Tensor token_tensor;
-    if (!latest_output_ids.defined() || latest_output_ids.numel() == 0) {
-        token_tensor = torch::empty({1, 0}, torch::kInt32);
-    } else {
-        // Normalize to [1, N]
-        if (latest_output_ids.dim() == 1) {
-            token_tensor = latest_output_ids.unsqueeze(0).to(torch::kInt32);
+    if (return_hidden_states) {
+        if (all_output_ids.empty()) {
+            token_tensor = torch::empty({1, 0}, torch::kInt32);
         } else {
-            token_tensor = latest_output_ids.to(torch::kInt32);
+            token_tensor = torch::from_blob(all_output_ids.data(),
+                                            {1, static_cast<int64_t>(all_output_ids.size())},
+                                            torch::kInt32).clone();
+        }
+    } else {
+        if (!cumulative_output_ids.defined() || cumulative_output_ids.numel() == 0) {
+            token_tensor = torch::empty({1, 0}, torch::kInt32);
+        } else if (cumulative_output_ids.dim() == 1) {
+            token_tensor = cumulative_output_ids.unsqueeze(0);
+        } else {
+            token_tensor = cumulative_output_ids;
         }
     }
 

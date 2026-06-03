@@ -71,3 +71,30 @@ class RtpLLMOp:
             return result
         token_ids, _ = result
         return token_ids
+
+    def generate_with_callback(self, input_ids, callback,
+                               max_new_tokens: int = 4096,
+                               eos_token_id: int = -1):
+        """Streaming variant of generate(). Invokes `callback` per step.
+
+        The callback signature is:
+            callback(token_chunk, hidden_chunk, finished)
+        where:
+          - token_chunk: int32 CPU tensor of NEW token ids for this step
+            (None if no tokens were emitted this step).
+          - hidden_chunk: float CPU tensor [n, hidden_dim] of last-layer
+            hidden states for the new tokens (None if absent).
+          - finished: bool, True on the terminal step.
+
+        Returns the final (token_ids[1, N], hidden_states[N, hidden_dim])
+        accumulated across all steps — same shape as
+        generate(..., return_hidden_states=True).
+        """
+        if not hasattr(self.ft_op, 'generate_with_callback'):
+            raise RuntimeError(
+                "C++ RtpLLMOp.generate_with_callback() not available. "
+                "Rebuild with: bazelisk build //:th_transformer"
+            )
+        return self.ft_op.generate_with_callback(
+            input_ids, max_new_tokens, eos_token_id, callback,
+        )

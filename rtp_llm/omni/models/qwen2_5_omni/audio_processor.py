@@ -23,8 +23,11 @@ from rtp_llm.utils.util import get_config_from_path
 
 
 class Processor(AudioEmbeddingInterface):
-    def __init__(self, mm_related_params, ckpt_path: str):
+    def __init__(self, mm_related_params, ckpt_path: str, model_config=None):
         self.mm_related_params = mm_related_params
+        # `self.config` is read by AudioEmbeddingInterface._data_type, which
+        # returns self.config.compute_dtype.  We mirror the qwen2_vl_vit pattern.
+        self.config = model_config
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(ckpt_path)
 
         config_json = get_config_from_path(ckpt_path)

@@ -34,6 +34,17 @@ public:
     std::tuple<torch::Tensor, torch::Tensor>
     generate(torch::Tensor input_ids, int64_t max_new_tokens, int64_t eos_token_id, bool return_hidden_states);
 
+    // Streaming variant of generate(). `callback` is a Python callable invoked
+    // once per generated step from the engine loop with
+    //   callback(token_chunk: int32 CPU tensor, hidden_chunk: CPU tensor)
+    // The GIL is released between steps and acquired only for the callback.
+    // Always returns the final accumulated (token_ids, hidden_states) tuple
+    // (same shape as `generate(return_hidden_states=true)`).
+    std::tuple<torch::Tensor, torch::Tensor> generateWithCallback(torch::Tensor input_ids,
+                                                                  int64_t       max_new_tokens,
+                                                                  int64_t       eos_token_id,
+                                                                  py::object    callback);
+
 private:
     void             _init(int64_t                                       model_rpc_port,
                            int64_t                                       http_port,

@@ -20,6 +20,7 @@
 
 #if USING_CUDA
 #include "c10/cuda/CUDACachingAllocator.h"
+#include "c10/cuda/CUDAGuard.h"
 #endif
 
 #ifdef __linux__
@@ -63,10 +64,17 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
                    params.parallelism_config.dp_rank * params.parallelism_config.tp_size
                        + params.parallelism_config.tp_rank) {
     RTP_LLM_LOG_INFO(__PRETTY_FUNCTION__);
-#if !USING_CUDA
-    // On ROCm, this constructor runs on a gRPC handler thread that defaults to
-    // GPU 0. Set the correct device so all GPU allocations (KV cache, etc.) go
-    // to the right device.  The guard is scoped to the constructor body.
+    // EngineBase::initRuntime has already called cudaSetDevice(device_id_)
+    // on this thread for us. Wrap the rest of the constructor in a
+    // device guard so any code path that incidentally switches the
+    // device (Python callouts, PyTorch lazy init, etc.) doesn't leak
+    // construction-time allocations onto another GPU. Critical for the
+    // multi-stage / multi-GPU case (e.g. Qwen Omni talker on cuda:1
+    // while thinker is resident on cuda:0).
+#if USING_CUDA
+    c10::cuda::CUDAGuard ctor_device_guard(static_cast<c10::DeviceIndex>(device_id_));
+    RTP_LLM_LOG_INFO("NormalEngine ctor: pin device to %ld via CUDAGuard", device_id_);
+#else
     c10::DeviceGuard ctor_device_guard(
         c10::Device(c10::kCUDA, static_cast<c10::DeviceIndex>(parallelism_config.local_rank)));
     RTP_LLM_LOG_INFO("ROCm NormalEngine ctor: set device to %d", parallelism_config.local_rank);
@@ -381,8 +389,12 @@ absl::Status NormalEngine::stop() {
 
 void NormalEngine::loop() {
     RTP_LLM_PROFILE_FUNCTION();
-    RTP_LLM_LOG_INFO("loop begin");
-    cudaPreRun(getDeviceId());
+    // Use the per-engine device (EngineBase::device_id_) rather than the
+    // process-global getDeviceId(). With multiple engines coexisting on
+    // different GPUs (Qwen Omni thinker on cuda:0, talker on cuda:1), the
+    // global only reflects whichever engine initialized first.
+    RTP_LLM_LOG_INFO("loop begin (device_id=%ld)", device_id_);
+    cudaPreRun(static_cast<int>(device_id_));
     while (running_) {
         auto status = step();
         if (!status.ok()) {

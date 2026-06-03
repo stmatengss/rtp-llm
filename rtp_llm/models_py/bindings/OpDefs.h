@@ -223,6 +223,21 @@ struct PyModelInputs {
     torch::Tensor       input_hiddens;
     PyAttentionInputs   attention_inputs;
     BertEmbeddingInputs bert_embedding_inputs;
+
+    // Multimodal feature fields. Set by PyWrappedModel when the request carries
+    // multimodal inputs (audio/image/video). Models that need to splice mm
+    // features into their input embeddings (e.g. Qwen2.5-Omni thinker) read
+    // these in their forward(). Default-empty for non-multimodal flows.
+    //
+    // multimodal_features:
+    //   list of [N_i, hidden_dim] tensors, one per multimodal input in the
+    //   batch. When empty/none, behaves as a pure-text request.
+    // mm_features_locs:
+    //   int32 [num_mm_inputs] tensor of start indices into combo_tokens where
+    //   each multimodal feature segment begins. Feature i occupies
+    //   combo_tokens[locs[i] : locs[i] + multimodal_features[i].size(0)].
+    std::optional<std::vector<torch::Tensor>> multimodal_features;
+    torch::Tensor                             mm_features_locs;
 };
 
 struct PyModelOutputs {

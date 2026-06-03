@@ -156,7 +156,13 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("input_hiddens", &PyModelInputs::input_hiddens, "Input hidden states tensor")
         .def_readwrite("attention_inputs", &PyModelInputs::attention_inputs, "Attention inputs structure")
         .def_readwrite(
-            "bert_embedding_inputs", &PyModelInputs::bert_embedding_inputs, "BERT embedding inputs structure");
+            "bert_embedding_inputs", &PyModelInputs::bert_embedding_inputs, "BERT embedding inputs structure")
+        .def_readwrite("multimodal_features",
+                       &PyModelInputs::multimodal_features,
+                       "Optional list of [N_i, hidden] multimodal feature tensors")
+        .def_readwrite("mm_features_locs",
+                       &PyModelInputs::mm_features_locs,
+                       "int32 tensor of start indices into combo_tokens for each mm feature");
 
     pybind11::class_<PyModelOutputs>(m, "PyModelOutputs")
         .def(pybind11::init<>(), "Default constructor")

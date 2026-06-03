@@ -30,13 +30,34 @@ class Qwen2_5OmniThinker(MultiModalMixin, QWenV2):
         vit_config: VitConfig,
     ):
         self.mm_part = Processor(
-            self.model_config.mm_related_params, self.model_config.ckpt_path
+            self.model_config.mm_related_params,
+            self.model_config.ckpt_path,
+            model_config=self.model_config,
         )
         self.model_config.mm_related_params.vit_weights = BaseVitWeights(
             {"audio_tower": self.mm_part.audio_tower},
             with_prefix=True,
         )
-        self.model_config.mm_related_params.vit_weights._ckpt_prefix = ""
+        self.model_config.mm_related_params.vit_weights._ckpt_prefix = "thinker."
+
+    def _create_python_model(self):
+        # Override the QWen-default Qwen3Model with the Omni thinker variant
+        # that scatters multimodal features into the embedding sequence at
+        # placeholder positions (-1 in input_ids, written by C++ MultimodalProcessor).
+        from rtp_llm.models_py.model_desc.qwen2_5_omni_thinker import (
+            Qwen2_5OmniThinkerModel,
+        )
+
+        self.py_model = Qwen2_5OmniThinkerModel(
+            self.model_config,
+            self.parallelism_config,
+            self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            quant_config=self.model_config.quant_config,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+            device_resource_config=self.device_resource_config,
+        )
 
     @classmethod
     def _create_config(cls, ckpt_path: str) -> ModelConfig:

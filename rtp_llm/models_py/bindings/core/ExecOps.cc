@@ -525,12 +525,8 @@ void execWriteCacheStore(const CacheStoreInputs&     inputs,
 MlaOpsType initRuntime(size_t device_id, bool trace_memory, bool enable_comm_overlap, MlaOpsType mla_ops_type) {
     MlaOpsType resolved_mla_ops_type = mla_ops_type;
 
-    // Guard against double-init
-    if (g_runtime_initialized.load(std::memory_order_acquire)) {
-        RTP_LLM_LOG_WARNING("Runtime is already initialized! will do nothing.");
-        return resolved_mla_ops_type;
-    }
-
+    // One-time process-global setup (trace_memory, comm overlap config,
+    // initial device probe for AUTO mla_ops_type). This runs ONCE per process.
     std::call_once(g_init_flag, [&]() {
         setlinebuf(stdout);
 
@@ -540,7 +536,7 @@ MlaOpsType initRuntime(size_t device_id, bool trace_memory, bool enable_comm_ove
         }
 
 #if USING_CUDA
-        RTP_LLM_LOG_INFO("Initialize runtime. device_id=%zu", device_id);
+        RTP_LLM_LOG_INFO("First-time runtime init on device_id=%zu", device_id);
         check_cuda_value(cudaSetDevice(device_id));
         at::cuda::setCurrentCUDAStream(at::cuda::getDefaultCUDAStream());
 
@@ -549,7 +545,7 @@ MlaOpsType initRuntime(size_t device_id, bool trace_memory, bool enable_comm_ove
             resolved_mla_ops_type = prop->major >= 9 ? MlaOpsType::FLASH_MLA : MlaOpsType::FLASH_INFER;
         }
 #elif USING_ROCM
-        RTP_LLM_LOG_INFO("Initialize runtime (ROCm). device_id=%zu", device_id);
+        RTP_LLM_LOG_INFO("First-time runtime init (ROCm) on device_id=%zu", device_id);
         ROCM_CHECK(hipSetDevice(device_id));
 #endif
 
@@ -559,6 +555,49 @@ MlaOpsType initRuntime(size_t device_id, bool trace_memory, bool enable_comm_ove
         g_runtime_initialized.store(true, std::memory_order_release);
         RTP_LLM_LOG_INFO("Runtime init done (communication via c10d ProcessGroup)");
     });
+
+    // ALWAYS (re)select the device on the calling thread, even on subsequent
+    // invocations. This lets multiple engines coexist on different GPUs in
+    // the same process (e.g. Qwen Omni thinker on cuda:0, talker on cuda:1):
+    // each engine's init thread + downstream allocations land on its own GPU.
+    // The one-time globals above (g_device_id, comm overlap) keep the first
+    // engine's settings; per-engine device tracking is the caller's job
+    // (see EngineBase::device_id_).
+#if USING_CUDA
+    RTP_LLM_LOG_INFO("initRuntime: set current thread device to %zu", device_id);
+    check_cuda_value(cudaSetDevice(device_id));
+    at::cuda::set_device(static_cast<c10::DeviceIndex>(device_id));
+
+    // Force PyTorch's lazy CUDA state for this device to initialize NOW,
+    // before we start allocating engine memory and spawning loop threads
+    // for it. Without this, the second-and-later devices in a multi-GPU
+    // process get half-initialized state (cuBLAS handle pool, default
+    // stream pool, workspace) which surfaces later as
+    // CUBLAS_STATUS_EXECUTION_FAILED / illegal-memory-access in custom
+    // CUDA kernels writing into KV-cache views. Touching getDeviceProperties
+    // + a no-op tensor allocation on the device performs the full lazy init
+    // (mirrors what std::call_once does for the FIRST device).
+    auto* prop = at::cuda::getDeviceProperties(static_cast<c10::DeviceIndex>(device_id));
+    (void)prop;
+    {
+        auto warm = torch::empty(
+            {1},
+            torch::TensorOptions().dtype(torch::kInt8).device(
+                torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_id))));
+        (void)warm;
+    }
+    at::cuda::setCurrentCUDAStream(at::cuda::getDefaultCUDAStream(device_id));
+
+    // Resolve AUTO for callers after the first one (call_once already
+    // resolved AUTO for the first caller; subsequent callers must resolve
+    // their own AUTO requests here using the device they actually run on).
+    if (resolved_mla_ops_type == MlaOpsType::AUTO) {
+        resolved_mla_ops_type = prop->major >= 9 ? MlaOpsType::FLASH_MLA : MlaOpsType::FLASH_INFER;
+    }
+#elif USING_ROCM
+    RTP_LLM_LOG_INFO("initRuntime (ROCm): set current thread device to %zu", device_id);
+    ROCM_CHECK(hipSetDevice(device_id));
+#endif
 
     RTP_LLM_LOG_INFO("init devices done");
     return resolved_mla_ops_type;

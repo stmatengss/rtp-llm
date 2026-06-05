@@ -340,7 +340,10 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
         torch::Tensor token_ids = micro_inputs.combo_tokens.clone().cuda();
         torch::Tensor input_hiddens =
             inputs.last_hidden_states.defined() ? inputs.last_hidden_states : torch::empty({0});
-        input_list.emplace_back(PyModelInputs{token_ids, input_hiddens, py_attn_inputs, bert_embedding_inputs});
+        PyModelInputs py_inputs{token_ids, input_hiddens, py_attn_inputs, bert_embedding_inputs};
+        py_inputs.multimodal_features = micro_inputs.multimodal_features;
+        py_inputs.mm_features_locs    = micro_inputs.mm_features_locs;
+        input_list.emplace_back(std::move(py_inputs));
     }
 
     if (!inputs.warmup && inputs.pd_separation) {
@@ -447,6 +450,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         fusedCopy(d2d_copies_);
 
         auto py_model_inputs = PyModelInputs({token_ids, input_hiddens, attention_inputs, bert_embedding_inputs});
+        py_model_inputs.multimodal_features = inputs.multimodal_features;
+        py_model_inputs.mm_features_locs    = inputs.mm_features_locs;
         PyModelOutputs py_model_outputs;
         torch::Tensor  hidden_states;
 

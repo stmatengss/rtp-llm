@@ -36,7 +36,7 @@ class Qwen2_5OmniThinker(MultiModalMixin, QWenV2):
             {"audio_tower": self.mm_part.audio_tower},
             with_prefix=True,
         )
-        self.model_config.mm_related_params.vit_weights._ckpt_prefix = ""
+        self.model_config.mm_related_params.vit_weights._ckpt_prefix = "thinker."
 
     @classmethod
     def _create_config(cls, ckpt_path: str) -> ModelConfig:

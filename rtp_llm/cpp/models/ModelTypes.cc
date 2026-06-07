@@ -55,6 +55,14 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         inputs.last_hidden_states.defined() ? inputs.last_hidden_states.numel() : 0;
     shape_hints_ptr[GptModelInputIndex::mtpHiddenStatesDtype] =
         inputs.last_hidden_states.defined() ? (std::uint8_t)torchDTypeToDataType(inputs.last_hidden_states.dtype()) : 0;
+    shape_hints_ptr[GptModelInputIndex::inputEmbeddingsNum] =
+        inputs.input_embeddings.has_value() ? inputs.input_embeddings.value().size() : 0;
+    shape_hints_ptr[GptModelInputIndex::inputEmbeddingsSize] =
+        shape_hints_ptr[GptModelInputIndex::inputEmbeddingsNum] ? inputs.input_embeddings.value()[0].size(1) : 0;
+    shape_hints_ptr[GptModelInputIndex::inputEmbeddingsDtype] =
+        shape_hints_ptr[GptModelInputIndex::inputEmbeddingsNum] ?
+            (std::uint8_t)torchDTypeToDataType(inputs.input_embeddings.value()[0].dtype()) :
+            0;
     shape_hints_ptr[GptModelInputIndex::skipRun] = inputs.skip_run;
     shape_hints_ptr[GptModelInputIndex::gptModelRequestLength] =
         inputs.request_id.defined() ? inputs.request_id.numel() : 0;
@@ -180,6 +188,19 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
             }
             inputs.multimodal_features = std::move(mm_features);
         }
+        const size_t ie_num = shape_hints_ptr[GptModelInputIndex::inputEmbeddingsNum];
+        if (ie_num) {
+            std::vector<torch::Tensor> ie_tensors;
+            auto ie_dtype =
+                dataTypeToTorchType((rtp_llm::DataType)shape_hints_ptr[GptModelInputIndex::inputEmbeddingsDtype]);
+            auto ie_size = (int64_t)shape_hints_ptr[GptModelInputIndex::inputEmbeddingsSize];
+            auto combo_len = (int64_t)shape_hints_ptr[GptModelInputIndex::comboTokens];
+            for (size_t i = 0; i < ie_num; ++i) {
+                ie_tensors.emplace_back(torch::empty({combo_len, ie_size},
+                                                     torch::TensorOptions().dtype(ie_dtype).device(torch::kCUDA)));
+            }
+            inputs.input_embeddings = std::move(ie_tensors);
+        }
     }
 
     // Collect all tensors that participate in broadcast.
@@ -229,6 +250,14 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     }
     if (hidden_states_size) {
         collect(inputs.last_hidden_states);
+    }
+    if (inputs.input_embeddings.has_value()) {
+        for (auto& ie : inputs.input_embeddings.value()) {
+            collect(ie);
+        }
+    }
+    if (inputs.input_embeddings_locs.defined()) {
+        collect(inputs.input_embeddings_locs);
     }
 
     // Classify tensors by device type (runtime check) and calculate packed sizes.

@@ -23,6 +23,16 @@ class Qwen25OmniTalkerWeight(QWenV2Weight):
                     identity,
                 )
                 break
+        weight_info.weights.append(AtomicWeight(
+            "thinker_to_talker_proj.weight",
+            [CkptWeightInfo("talker.thinker_to_talker_proj.weight", identity)],
+            identity,
+        ))
+        weight_info.weights.append(AtomicWeight(
+            "thinker_to_talker_proj.bias",
+            [CkptWeightInfo("talker.thinker_to_talker_proj.bias", identity)],
+            identity,
+        ))
         return weight_info
 
 

@@ -6,7 +6,7 @@ from rtp_llm.omni.config.stage_config import (
     StageExecutionType,
 )
 from rtp_llm.omni.engine.orchestrator import OmniOrchestrator, OmniRequestState
-from rtp_llm.omni.engine.stage_connector import SharedMemoryConnector
+from rtp_llm.omni.engine.stage_connector import SharedMemoryConnector, StageOutput
 
 
 class TestOmniRequestState(unittest.TestCase):
@@ -124,6 +124,50 @@ class TestOmniOrchestrator(unittest.TestCase):
         orchestrator.submit("req_1")
         orchestrator.cleanup("req_1")
         self.assertNotIn("req_1", orchestrator._requests)
+
+    def test_transform_stage_output_no_processor(self):
+        config = self._make_pipeline_config()
+        connector = SharedMemoryConnector()
+        orchestrator = OmniOrchestrator(
+            pipeline_config=config,
+            connector=connector,
+            stage_pools={},
+        )
+        output = StageOutput(token_ids=[1, 2, 3])
+        result = orchestrator.transform_stage_output(0, output)
+        self.assertIs(result, output)
+
+    def test_transform_stage_output_with_processor(self):
+        config = OmniPipelineConfig(
+            model_type="test_proc",
+            model_arch="TestProc",
+            stages=(
+                OmniStageConfig(
+                    stage_id=0,
+                    model_stage="entry",
+                    execution_type=StageExecutionType.LLM_AR,
+                    model_cls="TestEntry",
+                ),
+                OmniStageConfig(
+                    stage_id=1,
+                    model_stage="next",
+                    execution_type=StageExecutionType.LLM_AR,
+                    model_cls="TestNext",
+                    input_sources=(0,),
+                    custom_process_input_func="rtp_llm.omni.models.qwen2_5_omni.stage_processors.thinker2talker",
+                ),
+            ),
+        )
+        connector = SharedMemoryConnector()
+        orchestrator = OmniOrchestrator(
+            pipeline_config=config,
+            connector=connector,
+            stage_pools={},
+        )
+        output = StageOutput(token_ids=[1, 2], metadata={"text": "hello"})
+        result = orchestrator.transform_stage_output(1, output)
+        self.assertEqual(result.metadata["source_text"], "hello")
+        self.assertEqual(result.metadata["source_token_ids"], [1, 2])
 
 
 if __name__ == "__main__":

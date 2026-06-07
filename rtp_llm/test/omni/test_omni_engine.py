@@ -64,6 +64,58 @@ class TestOmniEngine(unittest.TestCase):
         engine = OmniEngine(pipeline_config=config)
         self.assertIsNotNone(engine.connector)
 
+    def test_register_and_get_stage_engine(self):
+        config = self._make_pipeline_config()
+        engine = OmniEngine(pipeline_config=config)
+        mock_engine = object()
+        engine.register_stage_engine(0, mock_engine)
+        self.assertIs(engine.get_stage_engine(0), mock_engine)
+        self.assertIsNone(engine.get_stage_engine(1))
+
+    def test_get_execution_order(self):
+        config = self._make_pipeline_config()
+        engine = OmniEngine(pipeline_config=config)
+        self.assertEqual(engine.get_execution_order(), [0, 1])
+
+    def test_transform_stage_output_no_processor(self):
+        from rtp_llm.omni.engine.stage_connector import StageOutput
+
+        config = self._make_pipeline_config()
+        engine = OmniEngine(pipeline_config=config)
+        output = StageOutput(token_ids=[1, 2, 3])
+        result = engine.transform_stage_output(0, output)
+        self.assertIs(result, output)
+
+    def test_transform_stage_output_with_processor(self):
+        from rtp_llm.omni.engine.stage_connector import StageOutput
+
+        config = OmniPipelineConfig(
+            model_type="test_proc",
+            model_arch="TestProc",
+            stages=(
+                OmniStageConfig(
+                    stage_id=0,
+                    model_stage="entry",
+                    execution_type=StageExecutionType.LLM_AR,
+                    model_cls="TestEntry",
+                ),
+                OmniStageConfig(
+                    stage_id=1,
+                    model_stage="next",
+                    execution_type=StageExecutionType.LLM_AR,
+                    model_cls="TestNext",
+                    input_sources=(0,),
+                    custom_process_input_func="rtp_llm.omni.models.qwen2_5_omni.stage_processors.thinker2talker",
+                ),
+            ),
+        )
+        engine = OmniEngine(pipeline_config=config)
+        output = StageOutput(
+            token_ids=[1, 2], metadata={"text": "hello"}
+        )
+        result = engine.transform_stage_output(1, output)
+        self.assertEqual(result.metadata["source_text"], "hello")
+
 
 if __name__ == "__main__":
     unittest.main()

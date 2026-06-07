@@ -28,6 +28,7 @@ class TestQwen25OmniPipelineConfig(unittest.TestCase):
         self.assertTrue(thinker.final_output)
         self.assertEqual(thinker.final_output_type, "text")
         self.assertTrue(thinker.requires_multimodal_data)
+        self.assertTrue(thinker.owns_tokenizer)
 
     def test_talker_stage(self):
         config = OmniPipelineRegistry.get("qwen2_5_omni")
@@ -36,6 +37,15 @@ class TestQwen25OmniPipelineConfig(unittest.TestCase):
         self.assertEqual(talker.execution_type, StageExecutionType.LLM_AR)
         self.assertEqual(talker.model_cls, "qwen2_5_omni_talker")
         self.assertEqual(talker.input_sources, (0,))
+        self.assertEqual(
+            talker.custom_process_input_func,
+            "rtp_llm.omni.models.qwen2_5_omni.stage_processors.thinker2talker",
+        )
+        self.assertEqual(talker.sampling_constraints, {"stop_token_ids": [8294]})
+
+    def test_pipeline_validates(self):
+        config = OmniPipelineRegistry.get("qwen2_5_omni")
+        config.validate()
 
     def test_code2wav_stage(self):
         config = OmniPipelineRegistry.get("qwen2_5_omni")

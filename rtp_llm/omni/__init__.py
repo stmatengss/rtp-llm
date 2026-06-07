@@ -14,7 +14,7 @@ from rtp_llm.omni.engine import (
     SharedMemoryConnector,
     StageConnector,
     StageOutput,
-    StageProcessorBase,
+    resolve_func,
 )
 
 import rtp_llm.omni.models  # noqa: F401

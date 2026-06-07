@@ -35,7 +35,11 @@ class TestOmniStageConfig(unittest.TestCase):
         self.assertIsNone(stage.final_output_type)
         self.assertFalse(stage.requires_multimodal_data)
         self.assertIsNone(stage.engine_output_type)
-        self.assertIsNone(stage.stage_processor)
+        self.assertIsNone(stage.custom_process_input_func)
+        self.assertFalse(stage.owns_tokenizer)
+        self.assertIsNone(stage.model_subdir)
+        self.assertEqual(stage.sampling_constraints, {})
+        self.assertEqual(stage.engine_overrides, {})
 
     def test_stage_config_with_all_fields(self):
         stage = OmniStageConfig(
@@ -48,12 +52,21 @@ class TestOmniStageConfig(unittest.TestCase):
             final_output_type="text",
             requires_multimodal_data=True,
             engine_output_type="latent",
-            stage_processor=None,
+            custom_process_input_func="some.module.func",
+            owns_tokenizer=True,
+            model_subdir="thinker",
+            sampling_constraints={"stop_token_ids": [8294]},
+            engine_overrides={"max_batch_size": 1},
         )
         self.assertTrue(stage.final_output)
         self.assertEqual(stage.final_output_type, "text")
         self.assertTrue(stage.requires_multimodal_data)
         self.assertEqual(stage.engine_output_type, "latent")
+        self.assertEqual(stage.custom_process_input_func, "some.module.func")
+        self.assertTrue(stage.owns_tokenizer)
+        self.assertEqual(stage.model_subdir, "thinker")
+        self.assertEqual(stage.sampling_constraints, {"stop_token_ids": [8294]})
+        self.assertEqual(stage.engine_overrides, {"max_batch_size": 1})
 
     def test_stage_config_is_frozen(self):
         stage = OmniStageConfig(
@@ -91,7 +104,7 @@ class TestOmniPipelineConfig(unittest.TestCase):
                     model_cls="Qwen2_5OmniTalker",
                     input_sources=(0,),
                     engine_output_type="latent",
-                    stage_processor="qwen2_5_omni.thinker2talker",
+                    custom_process_input_func="rtp_llm.omni.models.qwen2_5_omni.stage_processors.thinker2talker",
                 ),
                 OmniStageConfig(
                     stage_id=2,
@@ -101,7 +114,7 @@ class TestOmniPipelineConfig(unittest.TestCase):
                     input_sources=(1,),
                     final_output=True,
                     final_output_type="audio",
-                    stage_processor="qwen2_5_omni.talker2code2wav",
+                    custom_process_input_func="rtp_llm.omni.models.qwen2_5_omni.stage_processors.talker2code2wav",
                 ),
             ),
         )
@@ -139,6 +152,71 @@ class TestOmniPipelineConfig(unittest.TestCase):
         pipeline = self._make_pipeline()
         with self.assertRaises(KeyError):
             pipeline.get_stage(99)
+
+    def test_validate_passes_for_valid_pipeline(self):
+        pipeline = self._make_pipeline()
+        pipeline.validate()
+
+    def test_validate_duplicate_stage_ids(self):
+        pipeline = OmniPipelineConfig(
+            model_type="test",
+            model_arch="TestModel",
+            stages=(
+                OmniStageConfig(stage_id=0, model_stage="a",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="A"),
+                OmniStageConfig(stage_id=0, model_stage="b",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="B", input_sources=(0,)),
+            ),
+        )
+        with self.assertRaises(ValueError, msg="Duplicate stage_ids"):
+            pipeline.validate()
+
+    def test_validate_self_reference(self):
+        pipeline = OmniPipelineConfig(
+            model_type="test",
+            model_arch="TestModel",
+            stages=(
+                OmniStageConfig(stage_id=0, model_stage="a",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="A", input_sources=(0,)),
+            ),
+        )
+        with self.assertRaises(ValueError, msg="references itself"):
+            pipeline.validate()
+
+    def test_validate_nonexistent_input_source(self):
+        pipeline = OmniPipelineConfig(
+            model_type="test",
+            model_arch="TestModel",
+            stages=(
+                OmniStageConfig(stage_id=0, model_stage="a",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="A"),
+                OmniStageConfig(stage_id=1, model_stage="b",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="B", input_sources=(99,)),
+            ),
+        )
+        with self.assertRaises(ValueError, msg="nonexistent"):
+            pipeline.validate()
+
+    def test_validate_no_entry_point(self):
+        pipeline = OmniPipelineConfig(
+            model_type="test",
+            model_arch="TestModel",
+            stages=(
+                OmniStageConfig(stage_id=0, model_stage="a",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="A", input_sources=(1,)),
+                OmniStageConfig(stage_id=1, model_stage="b",
+                                execution_type=StageExecutionType.LLM_AR,
+                                model_cls="B", input_sources=(0,)),
+            ),
+        )
+        with self.assertRaises(ValueError, msg="no entry point"):
+            pipeline.validate()
 
 
 if __name__ == "__main__":

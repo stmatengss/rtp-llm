@@ -1,24 +1,22 @@
 import unittest
 
 from rtp_llm.omni.engine.stage_connector import StageOutput
-from rtp_llm.omni.engine.stage_processor_base import StageProcessorBase
+from rtp_llm.omni.engine.func_resolver import resolve_func
 
 
-class MockProcessor(StageProcessorBase):
-    def process(self, source_output: StageOutput) -> StageOutput:
-        new_ids = [x + 100 for x in source_output.token_ids] if source_output.token_ids else None
-        return StageOutput(token_ids=new_ids, metadata={"transformed": True})
+def mock_processor(source_output: StageOutput) -> StageOutput:
+    new_ids = [x + 100 for x in source_output.token_ids] if source_output.token_ids else None
+    return StageOutput(token_ids=new_ids, metadata={"transformed": True})
 
 
-class TestStageProcessorBase(unittest.TestCase):
-    def test_is_abstract(self):
-        with self.assertRaises(TypeError):
-            StageProcessorBase()
+class TestFuncResolver(unittest.TestCase):
+    def test_resolve_builtin_module(self):
+        func = resolve_func("os.path.join")
+        self.assertTrue(callable(func))
 
-    def test_concrete_processor(self):
-        proc = MockProcessor()
+    def test_plain_function_as_processor(self):
         source = StageOutput(token_ids=[1, 2, 3])
-        result = proc.process(source)
+        result = mock_processor(source)
         self.assertEqual(result.token_ids, [101, 102, 103])
         self.assertTrue(result.metadata["transformed"])
 

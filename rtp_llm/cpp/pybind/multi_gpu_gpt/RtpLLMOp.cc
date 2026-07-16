@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <memory>
 #include <tuple>
+#include <vector>
 #include "autil/Log.h"
 #include "c10/util/intrusive_ptr.h"
 #include <grpcpp/grpcpp.h>
@@ -9,12 +10,15 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/config/ModelConfig.h"
+#include "rtp_llm/cpp/config/MTPModelConfigHelper.h"
 #include "rtp_llm/cpp/pybind/multi_gpu_gpt/RtpLLMOp.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/WeightsConverter.h"
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/models/models_weight/W.h"
+#include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
+#include "rtp_llm/cpp/engine_base/stream/GenerateConfig.h"
 
 using namespace std;
 namespace th = torch;
@@ -33,29 +37,22 @@ prepareMTPEngineInitParams(size_t model_id, py::object propose_model, const Engi
     // Get model_config from model (only difference between propose and score models)
     auto model_config = sp_model.attr("model_config").cast<ModelConfig>();
 
-    py::object py_layers_weights     = sp_model.attr("weight").attr("weights");
-    py::object py_global_weights     = sp_model.attr("weight").attr("global_weights");
-    auto       convert               = WeightsConverter(false, model_config.quant_algo);
-    auto       py_layers_weights_vec = convertPyObjectToVec(py_layers_weights);
-    size_t     model_num             = py_layers_weights_vec.size();
-    size_t     gen_num_per_cycle     = base_params.sp_config.gen_num_per_cycle;
-    if (gen_num_per_cycle > 1 && py_layers_weights_vec.size() == 1) {
+    py::object   py_layers_weights     = sp_model.attr("weight").attr("weights");
+    py::object   py_global_weights     = sp_model.attr("weight").attr("global_weights");
+    auto         convert               = WeightsConverter(false, model_config.quant_algo);
+    auto         py_layers_weights_vec = convertPyObjectToVec(py_layers_weights);
+    const size_t weight_count          = py_layers_weights_vec.size();
+    size_t       gen_num_per_cycle     = base_params.sp_config.gen_num_per_cycle;
+    if (gen_num_per_cycle > 1 && weight_count == 1) {
         RTP_LLM_LOG_WARNING("duplicate py_layers_weights_vec from 1 to sp_config.gen_num_per_cycle: %ld",
                             gen_num_per_cycle);
-        for (size_t i = 1; i < gen_num_per_cycle; i++) {
-            py_layers_weights_vec.push_back(py_layers_weights_vec[0]);
-        }
-        model_num = gen_num_per_cycle;
     }
-    if (gen_num_per_cycle != py_layers_weights_vec.size()) {
-        RTP_LLM_LOG_WARNING("sp_config.gen_num_per_cycle: %ld  != py_layers_weights_vec.size(): %ld",
-                            gen_num_per_cycle,
-                            py_layers_weights_vec.size());
-        model_num = std::min(model_num, size_t(gen_num_per_cycle));
+    if (gen_num_per_cycle != weight_count && !(gen_num_per_cycle > 1 && weight_count == 1)) {
+        RTP_LLM_LOG_WARNING(
+            "sp_config.gen_num_per_cycle: %ld  != py_layers_weights_vec.size(): %ld", gen_num_per_cycle, weight_count);
     }
-    if (sp_type == SP_TYPE_EAGLE || sp_type == SP_TYPE_EAGLE3) {
-        model_num = 1;
-    }
+    const auto module_plan = buildMTPModuleConfigPlan(model_config, weight_count, gen_num_per_cycle, sp_type);
+    const auto model_num   = module_plan.module_configs.size();
 
     // Get py_eplb if available (from model)
     py::object py_eplb = py::none();
@@ -63,17 +60,18 @@ prepareMTPEngineInitParams(size_t model_id, py::object propose_model, const Engi
         py_eplb = sp_model.attr("py_eplb");
     }
 
-    // Create a temporary ModelConfig with num_layers = 1 for MTP
-    ModelConfig temp_model_config = model_config;
-    temp_model_config.num_layers  = 1;
-
-    for (int i = 0; i < model_num; i++) {
-        auto     layer_weigths = py_layers_weights_vec[i];
+    for (size_t i = 0; i < model_num; i++) {
+        const auto source_layer = module_plan.source_layer_indices[i];
+        RTP_LLM_CHECK_WITH_INFO(source_layer < py_layers_weights_vec.size(),
+                                "missing MTP layer weight for module %zu source layer %zu",
+                                i,
+                                source_layer);
+        auto     layer_weigths = py_layers_weights_vec[source_layer];
         py::list tmp;
         tmp.append(layer_weigths);
         auto gpt_weight = convert.createGptWeights(tmp, py_global_weights);
         mtp_params->push_back(std::move(std::make_unique<EngineInitParams>(model_id,
-                                                                           temp_model_config,
+                                                                           module_plan.module_configs[i],
                                                                            base_params.parallelism_config,
                                                                            base_params.runtime_config,
                                                                            base_params.pd_sep_config,
@@ -395,6 +393,116 @@ void RtpLLMOp::restart() {
     engine->restart();
 }
 
+std::tuple<torch::Tensor, torch::Tensor>
+RtpLLMOp::generate(torch::Tensor input_ids,
+                   int64_t       max_new_tokens,
+                   int64_t       eos_token_id,
+                   bool          return_hidden_states) {
+    auto engine = model_rpc_service_->getEngine();
+    RTP_LLM_CHECK_WITH_INFO(engine != nullptr, "Engine not initialized");
+
+    auto generate_config = std::make_shared<GenerateConfig>();
+    generate_config->max_new_tokens         = max_new_tokens;
+    generate_config->do_sample              = false;
+    generate_config->top_k                  = 1;
+    // Stream when hidden states are requested so we get one per generated token,
+    // not just the final step.
+    generate_config->is_streaming           = return_hidden_states;
+    generate_config->return_output_ids      = true;
+    generate_config->return_hidden_states   = return_hidden_states;
+    if (eos_token_id >= 0) {
+        generate_config->stop_words_list.push_back({static_cast<int>(eos_token_id)});
+    }
+
+    static std::atomic<int64_t> request_counter{100000};
+    auto generate_input             = std::make_shared<GenerateInput>();
+    generate_input->input_ids       = input_ids.to(torch::kInt32).contiguous();
+    generate_input->generate_config = generate_config;
+    generate_input->request_id      = request_counter.fetch_add(1);
+
+    auto stream = engine->enqueue(generate_input);
+    RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "Failed to enqueue generate request");
+
+    // Modes:
+    //   - non-streaming (return_hidden_states=false): engine emits ONE final
+    //     output with the full cumulative output_ids. We keep that one.
+    //   - streaming (return_hidden_states=true): one output per step. Each step's
+    //     output_ids contains only the NEW token, and hidden_states contains the
+    //     last-layer state for that new token. We accumulate both.
+    std::vector<int32_t>         all_output_ids;
+    torch::Tensor                cumulative_output_ids;
+    std::vector<torch::Tensor>   hidden_state_chunks;
+    {
+        pybind11::gil_scoped_release release;
+        while (true) {
+            auto output_result = stream->nextOutput();
+            if (!output_result.ok()) {
+                if (output_result.status().code() == ErrorCode::FINISHED) {
+                    break;  // Normal stream completion, no more data
+                }
+                // Real error — propagate to Python caller via pybind11
+                throw std::runtime_error(
+                    std::string("Generate stream error: ") +
+                    output_result.status().ToString());
+            }
+            auto& outputs = output_result.value();
+            for (auto& output : outputs.generate_outputs) {
+                if (output.output_ids.defined() && output.output_ids.numel() > 0) {
+                    auto ids_cpu = output.output_ids.cpu().contiguous().to(torch::kInt32);
+                    if (return_hidden_states) {
+                        // streaming: append the new tokens
+                        auto data_ptr = ids_cpu.data_ptr<int32_t>();
+                        int64_t total = ids_cpu.numel();
+                        for (int64_t i = 0; i < total; i++) {
+                            all_output_ids.push_back(data_ptr[i]);
+                        }
+                    } else {
+                        // non-streaming: keep latest cumulative
+                        cumulative_output_ids = ids_cpu;
+                    }
+                }
+                if (return_hidden_states && output.hidden_states.has_value()
+                    && output.hidden_states->defined()
+                    && output.hidden_states->numel() > 0) {
+                    hidden_state_chunks.push_back(output.hidden_states->cpu().contiguous());
+                }
+                if (output.finished) {
+                    goto done;
+                }
+            }
+        }
+        done:;
+    }
+
+    torch::Tensor token_tensor;
+    if (return_hidden_states) {
+        if (all_output_ids.empty()) {
+            token_tensor = torch::empty({1, 0}, torch::kInt32);
+        } else {
+            token_tensor = torch::from_blob(all_output_ids.data(),
+                                            {1, static_cast<int64_t>(all_output_ids.size())},
+                                            torch::kInt32).clone();
+        }
+    } else {
+        if (!cumulative_output_ids.defined() || cumulative_output_ids.numel() == 0) {
+            token_tensor = torch::empty({1, 0}, torch::kInt32);
+        } else if (cumulative_output_ids.dim() == 1) {
+            token_tensor = cumulative_output_ids.unsqueeze(0);
+        } else {
+            token_tensor = cumulative_output_ids;
+        }
+    }
+
+    torch::Tensor hidden_tensor;
+    if (hidden_state_chunks.empty()) {
+        hidden_tensor = torch::empty({0, 0});
+    } else {
+        hidden_tensor = torch::cat(hidden_state_chunks, /*dim=*/0);
+    }
+
+    return std::make_tuple(token_tensor, hidden_tensor);
+}
+
 void registerRtpLLMOp(const py::module& m) {
     pybind11::class_<RtpLLMOp>(m, "RtpLLMOp")
         .def(pybind11::init<>())
@@ -412,7 +520,13 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("world_info"),
              py::arg("tokenizer"),
              py::arg("render"))
-        .def("stop", &RtpLLMOp::stop);
+        .def("stop", &RtpLLMOp::stop)
+        .def("generate",
+             &RtpLLMOp::generate,
+             py::arg("input_ids"),
+             py::arg("max_new_tokens"),
+             py::arg("eos_token_id"),
+             py::arg("return_hidden_states") = false);
 }
 
 }  // namespace rtp_llm
